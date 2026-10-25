@@ -52,20 +52,36 @@ public final class WakeOnLan {
         new Thread(() -> {
             try (DatagramSocket socket = new DatagramSocket()) {
                 socket.setBroadcast(true);
-                DatagramPacket datagram = new DatagramPacket(packet, packet.length,
-                        InetAddress.getByName("255.255.255.255"), 9);
-                for (int i = 0; i < 3; i++) {
-                    socket.send(datagram);
+                sendRepeated(socket, packet, InetAddress.getByName("255.255.255.255"), 9);
+                sendRepeated(socket, packet, InetAddress.getByName("255.255.255.255"), 7);
+                if (host != null && !host.isEmpty()) {
                     try {
-                        Thread.sleep(80);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return;
+                        InetAddress addr = InetAddress.getByName(host);
+                        sendRepeated(socket, packet, addr, 9);
+                        sendRepeated(socket, packet, addr, 7);
+                        byte[] ipBytes = addr.getAddress();
+                        if (ipBytes.length == 4) {
+                            ipBytes[3] = (byte) 255;
+                            sendRepeated(socket, packet, InetAddress.getByAddress(ipBytes), 9);
+                            sendRepeated(socket, packet, InetAddress.getByAddress(ipBytes), 7);
+                        }
+                    } catch (Exception ignored) {
                     }
                 }
             } catch (Exception ignored) {
-                // Best effort: power-on only works with Wake-on-LAN enabled on the TV.
+                // Best effort: power-on only works with Wake-on-LAN enabled on the target device.
             }
         }, "wake-on-lan").start();
+    }
+
+    private static void sendRepeated(DatagramSocket socket, byte[] packet, InetAddress target, int port) {
+        try {
+            DatagramPacket datagram = new DatagramPacket(packet, packet.length, target, port);
+            for (int i = 0; i < 3; i++) {
+                socket.send(datagram);
+                Thread.sleep(40);
+            }
+        } catch (Exception ignored) {
+        }
     }
 }

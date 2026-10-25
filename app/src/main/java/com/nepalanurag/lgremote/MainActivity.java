@@ -2511,9 +2511,19 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     }
 
     private void wakeBoxCec(boolean explicit) {
+        String boxHost = SecureStore.getBoxHost(this);
+        String boxMac = SecureStore.getBoxMac(this);
+        boolean hasBoxMac = WakeOnLan.isValidMac(boxMac);
+        if (hasBoxMac) {
+            WakeOnLan.send(boxMac, boxHost);
+        }
         if (!AndroidTvRemote.isPaired(this)) {
             if (explicit) {
-                toast(R.string.box_not_paired);
+                if (hasBoxMac) {
+                    toast(R.string.box_wake_wol_sent);
+                } else {
+                    toast(R.string.box_not_paired);
+                }
             }
             return;
         }
@@ -2525,7 +2535,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 toast(R.string.wake_box_sent);
                 retry();
             } else if (explicit) {
-                toast(error == null ? getString(R.string.wake_box_failed) : error);
+                if (hasBoxMac) {
+                    toast(R.string.box_wake_wol_sent);
+                } else {
+                    toast(error == null ? getString(R.string.wake_box_failed) : error);
+                }
             }
         });
     }
@@ -2535,7 +2549,9 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         String mac = SecureStore.getMac(this);
         boolean hasMac = WakeOnLan.isValidMac(mac);
         boolean hasBox = AndroidTvRemote.isPaired(this);
-        if (!hasMac && !hasBox) {
+        String boxMac = SecureStore.getBoxMac(this);
+        boolean hasBoxMac = WakeOnLan.isValidMac(boxMac);
+        if (!hasMac && !hasBox && !hasBoxMac) {
             new AlertDialog.Builder(this)
                     .setTitle(R.string.wake)
                     .setMessage(R.string.no_mac)
@@ -2550,7 +2566,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         } else {
             toast(R.string.wake_box_sending);
         }
-        if (hasBox) {
+        if (hasBox || hasBoxMac) {
             wakeBoxCec(false);
         }
         retry();
@@ -2677,6 +2693,54 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             clickHaptic(v);
             showBoxInputPicker(boxInputRow);
         });
+
+        content.addView(Ui.label(this, getString(R.string.box_wake_mac)));
+        LinearLayout boxMacRow = Ui.row(this);
+        LinearLayout.LayoutParams boxMacRowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        boxMacRowParams.topMargin = dp(8);
+        content.addView(boxMacRow, boxMacRowParams);
+        EditText boxMacField = new EditText(this);
+        boxMacField.setHint(R.string.wake_mac_hint);
+        boxMacField.setHintTextColor(getColor(R.color.muted));
+        boxMacField.setTextColor(getColor(R.color.text));
+        boxMacField.setTextSize(13);
+        boxMacField.setSingleLine(true);
+        boxMacField.setInputType(InputType.TYPE_CLASS_TEXT);
+        boxMacField.setPadding(dp(12), 0, dp(12), 0);
+        boxMacField.setBackground(Ui.round(this, getColor(R.color.surface_2), 12,
+                getColor(R.color.stroke), 1));
+        boxMacField.setText(SecureStore.getBoxMac(this));
+        boxMacRow.addView(boxMacField, new LinearLayout.LayoutParams(0, dp(46), 1f));
+        TextView saveBoxMac = pill(getString(R.string.save), false);
+        LinearLayout.LayoutParams saveBoxMacParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(46));
+        saveBoxMacParams.leftMargin = dp(8);
+        boxMacRow.addView(saveBoxMac, saveBoxMacParams);
+        saveBoxMac.setOnClickListener(v -> {
+            clickHaptic(v);
+            String value = boxMacField.getText().toString().trim();
+            if (value.isEmpty()) {
+                SecureStore.setBoxMac(this, "");
+                toast(R.string.mac_saved);
+                return;
+            }
+            String normalized = WakeOnLan.normalize(value);
+            if (normalized == null) {
+                boxMacField.setError(getString(R.string.mac_invalid));
+                return;
+            }
+            SecureStore.setBoxMac(this, normalized);
+            boxMacField.setText(normalized);
+            toast(R.string.mac_saved);
+        });
+        TextView boxMacHelp = Ui.text(this, getString(R.string.box_wake_mac_help), 11,
+                getColor(R.color.muted), Typeface.NORMAL);
+        boxMacHelp.setLineSpacing(0f, 1.25f);
+        LinearLayout.LayoutParams boxMacHelpParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        boxMacHelpParams.topMargin = dp(7);
+        content.addView(boxMacHelp, boxMacHelpParams);
 
         content.addView(divider(), sectionGap());
 

@@ -35,6 +35,7 @@ public final class SecureStore {
     private static final String PREF_BOX_NAME = "box_name";
     private static final String PREF_BOX_INPUT_ID = "box_input_id";
     private static final String PREF_BOX_INPUT_LABEL = "box_input_label";
+    private static final String PREF_BOX_MAC = "box_mac";
 
     // Older builds stored the same Android TV pairing under "den" keys. Read them once so an
     // existing pairing keeps working after the app became device-name agnostic.
@@ -306,6 +307,21 @@ public final class SecureStore {
 
     public static void setMac(Context context, String mac) {
         prefs(context).edit().putString(PREF_MAC, mac == null ? "" : mac).apply();
+    }
+
+    public static String getBoxMac(Context context) {
+        String saved = prefs(context).getString(PREF_BOX_MAC, "");
+        if (saved.isEmpty()) {
+            String host = getBoxHost(context);
+            if ("192.168.50.254".equals(host)) {
+                return "A4:E8:8D:F1:81:22";
+            }
+        }
+        return saved;
+    }
+
+    public static void setBoxMac(Context context, String mac) {
+        prefs(context).edit().putString(PREF_BOX_MAC, mac == null ? "" : mac).apply();
     }
 
     public static float getPointerSpeed(Context context) {

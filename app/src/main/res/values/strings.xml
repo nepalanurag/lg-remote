@@ -197,6 +197,9 @@
     <string name="lg_home_sent">LG Home sent</string>
     <string name="wake_box_cec">Turn on box (Wake TV via HDMI-CEC)</string>
     <string name="wake_box_sending">Turning on Android TV box…</string>
-    <string name="wake_box_sent">Wake signal sent to Android TV box (HDMI-CEC).</string>
+    <string name="wake_box_sent">Wake signal sent to Android TV box.</string>
     <string name="wake_box_failed">Could not reach the Android TV box.</string>
+    <string name="box_wake_mac">Box Wake-on-LAN MAC</string>
+    <string name="box_wake_mac_help">Used to send Wake-on-LAN magic packets to turn on the Android TV box when in deep standby.</string>
+    <string name="box_wake_wol_sent">Wake-on-LAN sent to Android TV box.</string>
 </resources>
