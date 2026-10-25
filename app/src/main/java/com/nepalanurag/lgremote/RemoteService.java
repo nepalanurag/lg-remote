@@ -417,7 +417,11 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
 
     private void updateActiveControllers() {
         if (boxController != null) {
-            boxController.setActive(state == LgTvClient.State.READY && isBoxActive());
+            boolean active = state == LgTvClient.State.READY && isBoxActive();
+            boxController.setActive(active);
+            if (active && boxMouse != null && !boxMouse.isConnected()) {
+                boxMouse.autoConnect();
+            }
         }
     }
 

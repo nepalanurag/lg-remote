@@ -14,6 +14,7 @@ import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 
 import java.util.concurrent.Executors;
@@ -307,17 +308,23 @@ public final class BoxBluetoothMouse {
     }
 
     public void autoConnect() {
-        if (connectedDevice != null || hidDevice == null || !registered || !hasPermission() || adapter == null) {
+        if (connectedDevice != null || hidDevice == null || !hasPermission() || adapter == null) {
+            return;
+        }
+        if (!registered) {
+            mainHandler.postDelayed(this::autoConnect, 350);
             return;
         }
         String savedMac = SecureStore.getBoxBtMac(context);
+        Log.d(TAG, "Bluetooth HID autoConnect: registered=" + registered + " savedMac=" + savedMac);
         if (!savedMac.isEmpty()) {
             try {
                 BluetoothDevice dev = adapter.getRemoteDevice(savedMac);
                 if (dev != null) {
                     connect(dev);
                 }
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                Log.w(TAG, "Bluetooth HID autoConnect error: " + e.getMessage());
             }
         }
     }
@@ -380,21 +387,98 @@ public final class BoxBluetoothMouse {
         }
     }
 
+    private final Object moveLock = new Object();
+    private float accumX = 0f;
+    private float accumY = 0f;
+    private int pendingDx = 0;
+    private int pendingDy = 0;
+    private boolean pendingButton = false;
+    private long lastDispatchTime = 0;
+    private boolean flushScheduled = false;
+    private float scrollAccum = 0f;
+
+    private static final long DISPATCH_INTERVAL_MS = 10;
+
     public boolean sendMove(int dx, int dy, boolean buttonDown) {
         if (!isConnected() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !hasPermission()) {
             return false;
         }
-        byte buttons = (byte) (buttonDown ? 0x01 : 0x00);
-        byte rx = (byte) Math.max(-127, Math.min(127, dx));
-        byte ry = (byte) Math.max(-127, Math.min(127, dy));
+
+        // Kinetic acceleration curve tuned for large TV screens (slow movements are precise, flicks sweep across 4K)
+        double dist = Math.hypot(dx, dy);
+        double factor;
+        if (dist < 2.5) {
+            factor = 1.35;
+        } else if (dist < 8.0) {
+            factor = 1.35 + (dist - 2.5) * 0.28;
+        } else {
+            factor = 2.89 + Math.min(3.2, (dist - 8.0) * 0.20);
+        }
+
+        synchronized (moveLock) {
+            accumX += (float) (dx * factor);
+            accumY += (float) (dy * factor);
+            int mx = (int) accumX;
+            int my = (int) accumY;
+            accumX -= mx;
+            accumY -= my;
+
+            pendingDx += mx;
+            pendingDy += my;
+            pendingButton = buttonDown;
+
+            long now = SystemClock.uptimeMillis();
+            long elapsed = now - lastDispatchTime;
+
+            if (elapsed >= DISPATCH_INTERVAL_MS) {
+                dispatchPendingMoveLocked(now);
+            } else if (!flushScheduled) {
+                flushScheduled = true;
+                long delay = DISPATCH_INTERVAL_MS - elapsed;
+                executor.schedule(this::flushPendingMove, delay, TimeUnit.MILLISECONDS);
+            }
+        }
+        return true;
+    }
+
+    @SuppressWarnings({"NewApi", "MissingPermission"})
+    private void dispatchPendingMoveLocked(long now) {
+        if (pendingDx == 0 && pendingDy == 0 && !pendingButton && lastMouseReport[0] == 0) {
+            lastDispatchTime = now;
+            return;
+        }
+        if (hidDevice == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+            return;
+        }
+        byte rx = (byte) Math.max(-127, Math.min(127, pendingDx));
+        byte ry = (byte) Math.max(-127, Math.min(127, pendingDy));
+        pendingDx -= rx;
+        pendingDy -= ry;
+
+        byte buttons = (byte) (pendingButton ? 0x01 : 0x00);
         lastMouseReport[0] = buttons;
         lastMouseReport[1] = rx;
         lastMouseReport[2] = ry;
         lastMouseReport[3] = 0;
+        lastDispatchTime = now;
+
         try {
-            return hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, lastMouseReport);
-        } catch (SecurityException e) {
-            return false;
+            hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, lastMouseReport);
+        } catch (SecurityException ignored) {
+        }
+    }
+
+    private void flushPendingMove() {
+        synchronized (moveLock) {
+            flushScheduled = false;
+            if (isConnected() && hasPermission()) {
+                long now = SystemClock.uptimeMillis();
+                dispatchPendingMoveLocked(now);
+                if ((pendingDx != 0 || pendingDy != 0) && !flushScheduled) {
+                    flushScheduled = true;
+                    executor.schedule(this::flushPendingMove, DISPATCH_INTERVAL_MS, TimeUnit.MILLISECONDS);
+                }
+            }
         }
     }
 
@@ -402,14 +486,20 @@ public final class BoxBluetoothMouse {
         if (!isConnected() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !hasPermission()) {
             return false;
         }
+        synchronized (moveLock) {
+            pendingDx = 0;
+            pendingDy = 0;
+            accumX = 0f;
+            accumY = 0f;
+        }
         try {
-            // Button 1 down immediately
+            // Immediate button 1 down with zero latency
             lastMouseReport[0] = 0x01;
             lastMouseReport[1] = 0;
             lastMouseReport[2] = 0;
             lastMouseReport[3] = 0;
             boolean ok = hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x01, 0, 0, 0});
-            // Button 1 up after 15ms for zero perceptible latency
+            // Button 1 up after 15ms for crisp, instantaneous click response
             executor.schedule(() -> {
                 if (isConnected() && hasPermission()) {
                     try {
@@ -430,7 +520,13 @@ public final class BoxBluetoothMouse {
             return false;
         }
         // Invert dy for natural scrolling (swiping fingers up pushes content up / scrolls down)
-        byte wheel = (byte) Math.max(-127, Math.min(127, -dy));
+        scrollAccum += (-dy) * 0.45f;
+        int wheelClicks = (int) scrollAccum;
+        if (wheelClicks == 0) {
+            return true;
+        }
+        scrollAccum -= wheelClicks;
+        byte wheel = (byte) Math.max(-127, Math.min(127, wheelClicks));
         lastMouseReport[0] = 0;
         lastMouseReport[1] = 0;
         lastMouseReport[2] = 0;
