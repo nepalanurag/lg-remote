@@ -191,4 +191,11 @@
     <string name="tv_power_standby">STANDBY</string>
     <string name="tv_power_offline">OFF?</string>
     <string name="turn_on_sent">Turning the TV screen on…</string>
+    <string name="lg_home">LG Home</string>
+    <string name="lg_home_desc">Return to LG TV home screen</string>
+    <string name="lg_home_sent">LG Home sent</string>
+    <string name="wake_box_cec">Turn on box (Wake TV via HDMI-CEC)</string>
+    <string name="wake_box_sending">Turning on Android TV box…</string>
+    <string name="wake_box_sent">Wake signal sent to Android TV box (HDMI-CEC).</string>
+    <string name="wake_box_failed">Could not reach the Android TV box.</string>
 </resources>

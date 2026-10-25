@@ -28,6 +28,9 @@ Java only. Package `com.nepalanurag.lgremote`. Minimum Android 8.0 (API 26), tar
 **One screen, two devices**
 - When the box's HDMI input is the one on screen, Home, settings and text entry go to the box
 - Everything else keeps working on the TV
+- Long-pressing **Home** (or opening **Apps → LG Home**) returns to the LG TV Home screen from the Android TV box
+- Turning on the TV when offline or in standby sends Wake-on-LAN and simultaneously wakes the paired Android TV box over TLS (`KEYCODE_WAKEUP` + `KEYCODE_HOME`), triggering HDMI-CEC (One Touch Play / SIMPLINK) to wake the TV even when the TV's Wi-Fi interface is asleep
+- Long-pressing **Power** or selecting *Turn on box (Wake TV via HDMI-CEC)* in Settings allows waking the box and TV on demand
 
 **Automatic keyboard takeover**
 - Select a text field on the TV and the phone keyboard opens by itself

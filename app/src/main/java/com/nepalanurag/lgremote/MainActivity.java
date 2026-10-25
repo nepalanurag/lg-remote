@@ -767,6 +767,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         LinearLayout quick = Ui.row(this);
         View power = actionTile(R.drawable.ic_power, getString(R.string.power),
                 getColor(R.color.danger), this::powerPressed);
+        power.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            wakeBoxCec(true);
+            return true;
+        });
         View inputs = actionTile(R.drawable.ic_input, getString(R.string.inputs),
                 getColor(R.color.accent), this::showInputs);
         View apps = tvAppsTile();
@@ -836,6 +841,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
+        });
+        home.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            lgHomePressed();
+            return true;
         });
         keyControls.add(back);
         keyControls.add(home);
@@ -924,6 +934,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         LinearLayout quick = Ui.row(this);
         View power = actionTile(R.drawable.ic_power, getString(R.string.power),
                 getColor(R.color.danger), this::powerPressed);
+        power.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            wakeBoxCec(true);
+            return true;
+        });
         View inputs = actionTile(R.drawable.ic_input, getString(R.string.inputs),
                 getColor(R.color.accent), this::showInputs);
         View apps = tvAppsTile();
@@ -946,6 +961,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
+        });
+        home.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            lgHomePressed();
+            return true;
         });
         controls.addView(nav, landscapeRowParams(8));
         keyControls.add(back);
@@ -1025,6 +1045,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         LinearLayout quick = Ui.row(this);
         View power = actionTile(R.drawable.ic_power, getString(R.string.power),
                 getColor(R.color.danger), this::powerPressed);
+        power.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            wakeBoxCec(true);
+            return true;
+        });
         View inputs = actionTile(R.drawable.ic_input, getString(R.string.inputs),
                 getColor(R.color.accent), this::showInputs);
         View apps = tvAppsTile();
@@ -1053,6 +1078,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
+        });
+        home.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            lgHomePressed();
+            return true;
         });
         controls.addView(nav, landscapeRowParams(8));
         keyControls.add(back);
@@ -1154,6 +1184,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
+        });
+        home.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            lgHomePressed();
+            return true;
         });
         keyControls.add(back);
         keyControls.add(click);
@@ -1817,6 +1852,18 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         });
     }
 
+    private void lgHomePressed() {
+        if (service == null || !service.isConnected()) {
+            toast(R.string.tv_not_ready);
+            return;
+        }
+        if (service.sendLgButton("HOME")) {
+            toast(R.string.lg_home_sent);
+        } else {
+            toast(R.string.tv_not_ready);
+        }
+    }
+
     /** Opens settings on whichever device is currently on screen. */
     private void deviceSettingsPressed() {
         if (service == null || !service.isConnected()) {
@@ -2289,10 +2336,14 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private void showBoxOptions(Dialog settings) {
         new AlertDialog.Builder(this)
                 .setTitle(R.string.box_section)
-                .setItems(new String[]{getString(R.string.box_pair_again),
+                .setItems(new String[]{
+                        getString(R.string.wake_box_cec),
+                        getString(R.string.box_pair_again),
                         getString(R.string.forget_pairing)}, (dialog, which) -> {
                     settings.dismiss();
                     if (which == 0) {
+                        wakeBoxCec(true);
+                    } else if (which == 1) {
                         beginBoxPairing();
                     } else {
                         confirmForgetBox();
@@ -2385,10 +2436,32 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         wakeTv();
     }
 
+    private void wakeBoxCec(boolean explicit) {
+        if (!AndroidTvRemote.isPaired(this)) {
+            if (explicit) {
+                toast(R.string.box_not_paired);
+            }
+            return;
+        }
+        if (explicit) {
+            toast(R.string.wake_box_sending);
+        }
+        AndroidTvRemote.wakeBox(this, (ok, error) -> {
+            if (ok) {
+                toast(R.string.wake_box_sent);
+                retry();
+            } else if (explicit) {
+                toast(error == null ? getString(R.string.wake_box_failed) : error);
+            }
+        });
+    }
+
     private void wakeTv() {
         String ip = service != null ? service.getIp() : SecureStore.getSavedIp(this);
         String mac = SecureStore.getMac(this);
-        if (!WakeOnLan.isValidMac(mac)) {
+        boolean hasMac = WakeOnLan.isValidMac(mac);
+        boolean hasBox = AndroidTvRemote.isPaired(this);
+        if (!hasMac && !hasBox) {
             new AlertDialog.Builder(this)
                     .setTitle(R.string.wake)
                     .setMessage(R.string.no_mac)
@@ -2397,8 +2470,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                     .show();
             return;
         }
-        WakeOnLan.send(mac, ip);
-        toast(R.string.wake_sent);
+        if (hasMac) {
+            WakeOnLan.send(mac, ip);
+            toast(R.string.wake_sent);
+        } else {
+            toast(R.string.wake_box_sending);
+        }
+        if (hasBox) {
+            wakeBoxCec(false);
+        }
         retry();
     }
 
@@ -3026,10 +3106,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
         appsList.removeAllViews();
+        if (service != null && service.isBoxActive()) {
+            appsList.addView(lgHomeRow());
+        }
         if (apps == null || apps.isEmpty()) {
             if (appsStatus != null) {
                 appsStatus.setText(R.string.no_apps);
-                appsStatus.setVisibility(View.VISIBLE);
+                appsStatus.setVisibility(service != null && service.isBoxActive() ? View.GONE : View.VISIBLE);
             }
             return;
         }
@@ -3039,6 +3122,40 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         for (LgTvClient.TvApp app : apps) {
             appsList.addView(appRow(app));
         }
+    }
+
+    private View lgHomeRow() {
+        LinearLayout row = Ui.row(this);
+        row.setPadding(dp(10), dp(9), dp(10), dp(9));
+        row.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 12,
+                getColor(R.color.stroke), 1));
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rowParams.bottomMargin = dp(6);
+        row.setLayoutParams(rowParams);
+        row.setClickable(true);
+        row.setFocusable(true);
+        ImageView badge = Ui.icon(this, R.drawable.ic_home, getColor(R.color.accent), 18);
+        badge.setBackground(Ui.round(this, getColor(R.color.accent_dim), 10));
+        row.addView(badge, Ui.dpParams(this, 34, 34));
+        LinearLayout text = Ui.column(this);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        textParams.leftMargin = dp(10);
+        row.addView(text, textParams);
+        text.addView(Ui.text(this, getString(R.string.lg_home), 14, getColor(R.color.text), Typeface.BOLD));
+        TextView desc = Ui.text(this, getString(R.string.lg_home_desc), 10, getColor(R.color.muted), Typeface.NORMAL);
+        LinearLayout.LayoutParams descParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        descParams.topMargin = dp(2);
+        text.addView(desc, descParams);
+        row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 16));
+        row.setOnClickListener(v -> {
+            clickHaptic(v);
+            dismiss(appsDialog);
+            lgHomePressed();
+        });
+        return row;
     }
 
     private View appRow(LgTvClient.TvApp app) {

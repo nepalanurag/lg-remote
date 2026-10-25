@@ -49,21 +49,23 @@ public final class WakeOnLan {
             System.arraycopy(macBytes, 0, packet, 6 + i * 6, 6);
         }
 
-        try (DatagramSocket socket = new DatagramSocket()) {
-            socket.setBroadcast(true);
-            DatagramPacket datagram = new DatagramPacket(packet, packet.length,
-                    InetAddress.getByName("255.255.255.255"), 9);
-            for (int i = 0; i < 3; i++) {
-                socket.send(datagram);
-                try {
-                    Thread.sleep(80);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
+        new Thread(() -> {
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.setBroadcast(true);
+                DatagramPacket datagram = new DatagramPacket(packet, packet.length,
+                        InetAddress.getByName("255.255.255.255"), 9);
+                for (int i = 0; i < 3; i++) {
+                    socket.send(datagram);
+                    try {
+                        Thread.sleep(80);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
                 }
+            } catch (Exception ignored) {
+                // Best effort: power-on only works with Wake-on-LAN enabled on the TV.
             }
-        } catch (Exception ignored) {
-            // Best effort: power-on only works with Wake-on-LAN enabled on the TV.
-        }
+        }, "wake-on-lan").start();
     }
 }

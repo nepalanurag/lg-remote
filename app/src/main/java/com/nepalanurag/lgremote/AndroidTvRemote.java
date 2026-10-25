@@ -88,6 +88,7 @@ public final class AndroidTvRemote {
     private static final int KEYCODE_MEDIA_REWIND = 89;
     private static final int KEYCODE_MEDIA_FAST_FORWARD = 90;
     static final int KEYCODE_SETTINGS = 176;
+    public static final int KEYCODE_WAKEUP = 224;
     private static final int DIRECTION_SHORT = 3;
 
     private static final ExecutorService IO = Executors.newCachedThreadPool();
@@ -341,6 +342,22 @@ public final class AndroidTvRemote {
     /** Sends Home to the paired Android TV box, discovering it again if its address is stale. */
     public static void sendHome(Context context, ResultCallback callback) {
         sendKey(context, KEYCODE_HOME, "Home", callback);
+    }
+
+    /**
+     * Wakes or turns on the Android TV box so HDMI-CEC (One Touch Play) wakes the connected TV.
+     * Sends KEYCODE_WAKEUP first, followed by KEYCODE_HOME to ensure active-source assertion.
+     */
+    public static void wakeBox(Context context, ResultCallback callback) {
+        if (isMonitorReady()) {
+            sendMonitoredKey(KEYCODE_WAKEUP, "Wake", (ok, error) -> {
+                sendMonitoredKey(KEYCODE_HOME, "Home", callback);
+            });
+            return;
+        }
+        sendKey(context, KEYCODE_WAKEUP, "Wake", (ok, error) -> {
+            sendHome(context, callback);
+        });
     }
 
     /** Opens the Android TV settings screen on the paired box. */
