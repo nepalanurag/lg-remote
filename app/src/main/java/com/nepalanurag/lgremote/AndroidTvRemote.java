@@ -89,6 +89,8 @@ public final class AndroidTvRemote {
     private static final int KEYCODE_MEDIA_FAST_FORWARD = 90;
     static final int KEYCODE_SETTINGS = 176;
     public static final int KEYCODE_WAKEUP = 224;
+    private static final int DIRECTION_START_LONG = 1;
+    private static final int DIRECTION_END_LONG = 2;
     private static final int DIRECTION_SHORT = 3;
 
     private static final ExecutorService IO = Executors.newCachedThreadPool();
@@ -486,6 +488,15 @@ public final class AndroidTvRemote {
         current.sendKey(keyCode, label, callback);
     }
 
+    public static void sendMonitoredLongKey(int keyCode, String label, ResultCallback callback) {
+        TextMonitor current = textMonitor;
+        if (current == null) {
+            postResult(callback, false, "The box connection is not ready.");
+            return;
+        }
+        current.sendLongKey(keyCode, label, callback);
+    }
+
     /** Sends text over the persistent IME session that also tracks the focused box field. */
     public static void sendMonitoredText(String text, ResultCallback callback) {
         TextMonitor current = textMonitor;
@@ -645,6 +656,25 @@ public final class AndroidTvRemote {
             });
         }
 
+        void sendLongKey(int keyCode, String label, ResultCallback callback) {
+            if (!started || socket == null) {
+                postResult(callback, false, "The box is still connecting. Try again.");
+                return;
+            }
+            IO.execute(() -> {
+                try {
+                    write(remoteKey(keyCode, DIRECTION_START_LONG));
+                    Log.d(TAG, "Box IME: " + label + " START_LONG sent");
+                    Thread.sleep(550);
+                    write(remoteKey(keyCode, DIRECTION_END_LONG));
+                    Log.d(TAG, "Box IME: " + label + " END_LONG sent");
+                    postResult(callback, true, null);
+                } catch (Exception e) {
+                    postResult(callback, false, friendly(e));
+                }
+            });
+        }
+
         @Override
         public void run() {
             long backoff = 1200;
@@ -789,6 +819,12 @@ public final class AndroidTvRemote {
                 (host) -> sendKeyTo(context, host, keyCode, label), callback);
     }
 
+    public static void sendLongKey(Context context, int keyCode, String label,
+                                    ResultCallback callback) {
+        withBoxHost(context,
+                (host) -> sendLongKeyTo(context, host, keyCode, label), callback);
+    }
+
     private static void withBoxHost(Context context, BoxAction action, ResultCallback callback) {
         if (!isPaired(context)) {
             postResult(callback, false, "The Android TV box is not paired yet.");
@@ -897,6 +933,67 @@ public final class AndroidTvRemote {
                 throw new IOException("The Android TV box did not become ready.");
             }
             Log.d(TAG, "Box " + label + ": key sent");
+            Thread.sleep(250);
+        } finally {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static void sendLongKeyTo(Context context, String host, int keyCode, String label)
+            throws Exception {
+        Identity identity = loadIdentity(context);
+        SSLSocket socket = openSocket(identity, host, API_PORT);
+        socket.setSoTimeout(1200);
+        Log.d(TAG, "Box " + label + " (long): connected to " + host + ":" + API_PORT);
+        try {
+            int features = REQUESTED_FEATURES;
+            boolean configured = false;
+            boolean keySent = false;
+            long configuredAt = 0;
+            long deadline = System.currentTimeMillis() + 6000;
+            while (System.currentTimeMillis() < deadline && !keySent) {
+                try {
+                    RemoteInfo info = parseRemote(readMessage(socket));
+                    if (info.error) {
+                        throw new IOException("The Android TV box rejected the remote session.");
+                    }
+                    if (info.configure) {
+                        features = info.features & REQUESTED_FEATURES;
+                        if ((features & FEATURE_KEY) == 0) {
+                            features |= FEATURE_KEY;
+                        }
+                        send(socket, remoteConfigure(features));
+                        configured = true;
+                        configuredAt = System.currentTimeMillis();
+                    }
+                    if (info.setActive) {
+                        send(socket, remoteSetActive(features));
+                    }
+                    if (info.ping) {
+                        send(socket, remotePingResponse(info.pingValue));
+                    }
+                    if (info.start) {
+                        send(socket, remoteKey(keyCode, DIRECTION_START_LONG));
+                        Thread.sleep(550);
+                        send(socket, remoteKey(keyCode, DIRECTION_END_LONG));
+                        keySent = true;
+                    }
+                } catch (SocketTimeoutException timeout) {
+                    if (configured && !keySent && System.currentTimeMillis() - configuredAt > 1200) {
+                        send(socket, remoteKey(keyCode, DIRECTION_START_LONG));
+                        Thread.sleep(550);
+                        send(socket, remoteKey(keyCode, DIRECTION_END_LONG));
+                        keySent = true;
+                    }
+                }
+            }
+            if (!keySent) {
+                throw new IOException("The Android TV box did not become ready.");
+            }
+            Log.d(TAG, "Box " + label + ": long key sent");
             Thread.sleep(250);
         } finally {
             try {
@@ -1092,9 +1189,13 @@ public final class AndroidTvRemote {
     }
 
     static byte[] remoteKey(int keyCode) {
+        return remoteKey(keyCode, DIRECTION_SHORT);
+    }
+
+    static byte[] remoteKey(int keyCode, int direction) {
         Writer key = new Writer();
         key.varint(1, keyCode);
-        key.varint(2, DIRECTION_SHORT);
+        key.varint(2, direction);
         Writer message = new Writer();
         message.bytes(10, key.bytes());
         return message.bytes();

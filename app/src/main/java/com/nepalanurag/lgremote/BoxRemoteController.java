@@ -72,6 +72,18 @@ final class BoxRemoteController implements RemoteController {
         AndroidTvRemote.sendKey(context, code, label, callback::onResult);
     }
 
+    private void sendLongKey(int code, String label, Callback callback) {
+        if (code == 0) {
+            callback.onResult(false, "That button is not sent to the Android TV box.");
+            return;
+        }
+        if (AndroidTvRemote.isMonitorReady()) {
+            AndroidTvRemote.sendMonitoredLongKey(code, label, callback::onResult);
+            return;
+        }
+        AndroidTvRemote.sendLongKey(context, code, label, callback::onResult);
+    }
+
     @Override
     public void sendNavigation(String name, Callback callback) {
         if (!AndroidTvRemote.isPaired(context)) {
@@ -80,6 +92,15 @@ final class BoxRemoteController implements RemoteController {
             return;
         }
         sendKey(AndroidTvRemote.keyCodeFor(name), AndroidTvRemote.labelFor(name), callback);
+    }
+
+    @Override
+    public void sendNavigationLong(String name, Callback callback) {
+        if (!AndroidTvRemote.isPaired(context)) {
+            fallback.sendNavigationLong(name, callback);
+            return;
+        }
+        sendLongKey(AndroidTvRemote.keyCodeFor(name), AndroidTvRemote.labelFor(name), callback);
     }
 
     @Override

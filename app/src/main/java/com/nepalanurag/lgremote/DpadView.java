@@ -16,6 +16,8 @@ import android.view.View;
 public final class DpadView extends View {
     public interface Listener {
         void onButton(String name);
+
+        default void onButtonLongPress(String name) {}
     }
 
     private static final int NONE = 0;
@@ -43,6 +45,18 @@ public final class DpadView extends View {
     private float inner;
     private boolean haptics = true;
     private Runnable repeat;
+    private boolean okLongPressed;
+    private final Runnable okLongPressRunnable = () -> {
+        if (pressed == OK && isEnabled()) {
+            okLongPressed = true;
+            if (haptics) {
+                performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            }
+            if (listener != null) {
+                listener.onButtonLongPress("ENTER");
+            }
+        }
+    };
 
     public DpadView(Context context) {
         super(context);
@@ -196,6 +210,9 @@ public final class DpadView extends View {
                 return true;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
+                if (pressed == OK && !okLongPressed) {
+                    dispatch(OK);
+                }
                 cancelPress();
                 performClick();
                 return true;
@@ -205,20 +222,25 @@ public final class DpadView extends View {
     }
 
     private void press(int region, boolean repeatAllowed) {
-        if (region == NONE) {
-            return;
-        }
-        if (region == pressed) {
+        if (region == NONE || region == pressed) {
             return;
         }
         pressed = region;
+        handler.removeCallbacksAndMessages(null);
+        okLongPressed = false;
+
         if (haptics) {
             performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
         }
-        dispatch(region);
-        handler.removeCallbacksAndMessages(null);
-        if (repeatAllowed && (region == UP || region == DOWN || region == LEFT || region == RIGHT)) {
-            scheduleRepeat(region);
+
+        if (region == OK) {
+            // Wait 450ms to distinguish a tap click from a press-and-hold context action
+            handler.postDelayed(okLongPressRunnable, 450);
+        } else {
+            dispatch(region);
+            if (repeatAllowed && (region == UP || region == DOWN || region == LEFT || region == RIGHT)) {
+                scheduleRepeat(region);
+            }
         }
         invalidate();
     }
@@ -233,7 +255,7 @@ public final class DpadView extends View {
                 handler.postDelayed(repeat, 120);
             }
         };
-        handler.postDelayed(repeat, 420);
+        handler.postDelayed(repeat, 400);
     }
 
     private void dispatch(int region) {
@@ -264,6 +286,7 @@ public final class DpadView extends View {
     private void cancelPress() {
         handler.removeCallbacksAndMessages(null);
         repeat = null;
+        okLongPressed = false;
         pressed = NONE;
         invalidate();
     }

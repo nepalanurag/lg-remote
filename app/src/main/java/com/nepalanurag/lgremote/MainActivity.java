@@ -27,6 +27,7 @@ import android.util.Log;
 import android.util.Patterns;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -800,7 +801,17 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
         dpad = new DpadView(this);
         dpad.setHaptics(haptics);
-        dpad.setListener(name -> sendButton(name));
+        dpad.setListener(new DpadView.Listener() {
+            @Override
+            public void onButton(String name) {
+                sendButton(name);
+            }
+
+            @Override
+            public void onButtonLongPress(String name) {
+                sendButtonLong(name);
+            }
+        });
         dpad.setLayoutParams(new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         padRow.addView(dpad);
@@ -844,10 +855,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         View home = wideButton(R.drawable.ic_home, getString(R.string.home), 13);
         nav.addView(back, weighted(1f, 54, 0, 8));
         nav.addView(home, weighted(1f, 54, 0, 0));
-        back.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("BACK");
-        });
+        attachRepeat(back, () -> sendButton("BACK"), 400, 180);
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
@@ -871,18 +879,12 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         transport.addView(rewind, weighted(1f, 54, 0, 8));
         transport.addView(play, weighted(1f, 54, 0, 8));
         transport.addView(forward, weighted(1f, 54, 0, 0));
-        rewind.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("REWIND");
-        });
+        attachRepeat(rewind, () -> sendButton("REWIND"));
         play.setOnClickListener(v -> {
             clickHaptic(v);
             sendButton("PLAY");
         });
-        forward.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("FASTFORWARD");
-        });
+        attachRepeat(forward, () -> sendButton("FASTFORWARD"));
         keyControls.add(rewind);
         keyControls.add(play);
         keyControls.add(forward);
@@ -903,7 +905,17 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
         dpad = new DpadView(this);
         dpad.setHaptics(haptics);
-        dpad.setListener(name -> sendButton(name));
+        dpad.setListener(new DpadView.Listener() {
+            @Override
+            public void onButton(String name) {
+                sendButton(name);
+            }
+
+            @Override
+            public void onButtonLongPress(String name) {
+                sendButtonLong(name);
+            }
+        });
         board.addView(dpad, new LinearLayout.LayoutParams(size, size));
         keyControls.add(dpad);
 
@@ -964,10 +976,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         View home = wideButton(R.drawable.ic_home, getString(R.string.home), 13);
         nav.addView(back, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         nav.addView(home, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
-        back.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("BACK");
-        });
+        attachRepeat(back, () -> sendButton("BACK"), 400, 180);
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
@@ -988,18 +997,12 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         transport.addView(rewind, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         transport.addView(play, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         transport.addView(forward, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
-        rewind.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("REWIND");
-        });
+        attachRepeat(rewind, () -> sendButton("REWIND"));
         play.setOnClickListener(v -> {
             clickHaptic(v);
             sendButton("PLAY");
         });
-        forward.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("FASTFORWARD");
-        });
+        attachRepeat(forward, () -> sendButton("FASTFORWARD"));
         controls.addView(transport, landscapeRowParams(8));
         keyControls.add(rewind);
         keyControls.add(play);
@@ -1084,14 +1087,8 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         nav.addView(back, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 6));
         nav.addView(click, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 6));
         nav.addView(home, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
-        back.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("BACK");
-        });
-        click.setOnClickListener(v -> {
-            clickHaptic(v);
-            pointerClickPressed();
-        });
+        attachRepeat(back, () -> sendButton("BACK"), 400, 180);
+        attachClickHold(click);
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
@@ -1198,14 +1195,8 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         actions.addView(back, weighted(1f, 54, 0, 8));
         actions.addView(click, weighted(1f, 54, 0, 8));
         actions.addView(home, weighted(1f, 54, 0, 0));
-        back.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("BACK");
-        });
-        click.setOnClickListener(v -> {
-            clickHaptic(v);
-            pointerClickPressed();
-        });
+        attachRepeat(back, () -> sendButton("BACK"), 400, 180);
+        attachClickHold(click);
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
@@ -2052,6 +2043,18 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
         service.activeRemote().sendNavigation(name, this::onRemoteAction);
+    }
+
+    private void sendButtonLong(String name) {
+        if (service == null) {
+            toast(R.string.tv_not_ready);
+            return;
+        }
+        if ("VOLUMEUP".equals(name) || "VOLUMEDOWN".equals(name) || "MUTE".equals(name)) {
+            sendButton(name);
+            return;
+        }
+        service.activeRemote().sendNavigationLong(name, this::onRemoteAction);
     }
 
     private void onRemoteAction(boolean ok, String error) {
@@ -3670,6 +3673,10 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     }
 
     private void attachRepeat(View view, Runnable action) {
+        attachRepeat(view, action, 400, 120);
+    }
+
+    private void attachRepeat(View view, Runnable action, long initialDelayMs, long intervalMs) {
         final Handler handler = new Handler(Looper.getMainLooper());
         final boolean[] held = new boolean[1];
         final Runnable[] tick = new Runnable[1];
@@ -3690,11 +3697,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                         public void run() {
                             if (held[0]) {
                                 action.run();
-                                handler.postDelayed(this, 120);
+                                handler.postDelayed(this, intervalMs);
                             }
                         }
                     };
-                    handler.postDelayed(tick[0], 400);
+                    handler.postDelayed(tick[0], initialDelayMs);
                     return true;
                 case android.view.MotionEvent.ACTION_UP:
                 case android.view.MotionEvent.ACTION_CANCEL:
@@ -3702,6 +3709,50 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                     v.setPressed(false);
                     if (tick[0] != null) {
                         handler.removeCallbacks(tick[0]);
+                    }
+                    v.performClick();
+                    return true;
+                default:
+                    return false;
+            }
+        });
+    }
+
+    private void attachClickHold(View view) {
+        final Handler handler = new Handler(Looper.getMainLooper());
+        final boolean[] longFired = new boolean[1];
+        final Runnable longRunnable = () -> {
+            longFired[0] = true;
+            if (haptics) {
+                view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            }
+            if (service != null && service.isBoxActive()) {
+                sendButtonLong("ENTER");
+            }
+        };
+        view.setOnTouchListener((v, event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    if (!v.isEnabled()) return false;
+                    v.setPressed(true);
+                    longFired[0] = false;
+                    if (haptics) {
+                        v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                    }
+                    if (service != null && service.isBoxActive() && service.isBoxMouseConnected()) {
+                        service.sendMove(0, 0, true);
+                    }
+                    handler.postDelayed(longRunnable, 450);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    v.setPressed(false);
+                    handler.removeCallbacks(longRunnable);
+                    if (service != null && service.isBoxActive() && service.isBoxMouseConnected()) {
+                        service.sendMove(0, 0, false);
+                    }
+                    if (!longFired[0]) {
+                        pointerClickPressed();
                     }
                     v.performClick();
                     return true;

@@ -11,6 +11,10 @@ public interface RemoteController {
 
     void sendNavigation(String name, Callback callback);
 
+    default void sendNavigationLong(String name, Callback callback) {
+        sendNavigation(name, callback);
+    }
+
     void sendHome(Callback callback);
 
     void sendSettings(Callback callback);
