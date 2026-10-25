@@ -4,8 +4,6 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.RectF;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.AttributeSet;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
@@ -14,7 +12,7 @@ import android.view.ViewConfiguration;
 
 /**
  * Relative trackpad. One finger moves the TV pointer; tap clicks; two fingers scroll;
- * long-press then drag holds the mouse button down for drag-and-drop.
+ * two-finger tap secondary clicks.
  */
 public final class TrackpadView extends View {
     public interface Listener {
@@ -23,6 +21,8 @@ public final class TrackpadView extends View {
         void onClick();
 
         void onScroll(int dx, int dy);
+
+        default void onSecondaryClick() {}
     }
 
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -33,7 +33,6 @@ public final class TrackpadView extends View {
     private final Paint dotGlow = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint tag = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF panel = new RectF();
-    private final Handler handler = new Handler(Looper.getMainLooper());
     private final int touchSlop;
 
     private Listener listener;
@@ -43,12 +42,9 @@ public final class TrackpadView extends View {
     private String hintLabel;
     private String subLabel;
     private boolean touching;
-    private boolean dragging;
-    private boolean scrolling;
+    private boolean multiTouch;
     private float lastX;
     private float lastY;
-    private float downX;
-    private float downY;
     private float totalMove;
     private long downAt;
     private float accX;
@@ -57,9 +53,10 @@ public final class TrackpadView extends View {
     private float scrollAccY;
     private float scrollLastX;
     private float scrollLastY;
+    private float twoFingerMove;
+    private long twoFingerDownAt;
     private float dotX;
     private float dotY;
-    private Runnable longPress;
 
     public TrackpadView(Context context) {
         super(context);
@@ -141,16 +138,12 @@ public final class TrackpadView extends View {
             float midY = getHeight() / 2f;
             float midX = getWidth() / 2f;
             String hText = hintLabel != null ? hintLabel : getContext().getString(R.string.trackpad_hint);
-            String sText = subLabel != null ? subLabel : "Tap to click";
+            String sText = subLabel != null ? subLabel : "Tap to click · 2-finger scroll";
             canvas.drawText(hText, midX, midY - Ui.dp(getContext(), 4), hint);
             canvas.drawText(sText, midX, midY + Ui.dp(getContext(), 18), sub);
         } else {
             canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), 20), dotGlow);
-            canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), dragging ? 7 : 5), dot);
-            if (dragging) {
-                canvas.drawText("Drag · release to drop", getWidth() / 2f,
-                        getHeight() - Ui.dp(getContext(), 22), sub);
-            }
+            canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), 5), dot);
         }
     }
 
@@ -163,59 +156,62 @@ public final class TrackpadView extends View {
             case MotionEvent.ACTION_DOWN:
                 getParent().requestDisallowInterceptTouchEvent(true);
                 touching = true;
-                dragging = false;
-                scrolling = false;
-                downX = lastX = dotX = event.getX();
-                downY = lastY = dotY = event.getY();
+                multiTouch = false;
+                lastX = dotX = event.getX();
+                lastY = dotY = event.getY();
                 totalMove = 0;
                 downAt = System.currentTimeMillis();
                 accX = 0;
                 accY = 0;
-                scheduleLongPress();
                 invalidate();
                 return true;
 
             case MotionEvent.ACTION_POINTER_DOWN:
                 if (event.getPointerCount() >= 2) {
-                    cancelLongPressCallback();
-                    if (dragging) {
-                        dragging = false;
-                        sendMove(0, 0, false);
-                    }
-                    scrolling = true;
+                    multiTouch = true;
                     scrollLastX = averageX(event);
                     scrollLastY = averageY(event);
                     scrollAccX = 0;
                     scrollAccY = 0;
+                    twoFingerMove = 0;
+                    twoFingerDownAt = System.currentTimeMillis();
                     invalidate();
                 }
                 return true;
 
             case MotionEvent.ACTION_MOVE:
-                if (scrolling) {
-                    float x = averageX(event);
-                    float y = averageY(event);
-                    scrollAccX += (x - scrollLastX) * 0.55f;
-                    scrollAccY += (scrollLastY - y) * 0.7f;
-                    scrollLastX = x;
-                    scrollLastY = y;
-                    int sx = (int) scrollAccX;
-                    int sy = (int) scrollAccY;
-                    if (sx != 0 || sy != 0) {
-                        scrollAccX -= sx;
-                        scrollAccY -= sy;
-                        if (listener != null) {
-                            listener.onScroll(sx, sy);
+                if (multiTouch) {
+                    if (event.getPointerCount() >= 2) {
+                        float x = averageX(event);
+                        float y = averageY(event);
+                        float dx = x - scrollLastX;
+                        float dy = y - scrollLastY;
+                        scrollLastX = x;
+                        scrollLastY = y;
+                        twoFingerMove += Math.hypot(dx, dy);
+
+                        // Accumulate natural scroll deltas (positive sy when swiping up)
+                        scrollAccX += dx * 0.65f;
+                        scrollAccY += (-dy) * 0.65f;
+                        int sx = (int) scrollAccX;
+                        int sy = (int) scrollAccY;
+                        if (sx != 0 || sy != 0) {
+                            scrollAccX -= sx;
+                            scrollAccY -= sy;
+                            if (listener != null) {
+                                listener.onScroll(sx, sy);
+                            }
                         }
                     }
                     return true;
                 }
+
+                // Single finger cursor movement
                 float x = event.getX();
                 float y = event.getY();
                 float dx = x - lastX;
                 float dy = y - lastY;
-                float step = Math.abs(dx) + Math.abs(dy);
-                totalMove += step;
+                totalMove += Math.abs(dx) + Math.abs(dy);
                 lastX = x;
                 lastY = y;
                 dotX = x;
@@ -224,38 +220,35 @@ public final class TrackpadView extends View {
                     invalidate();
                     return true;
                 }
-                if (dragging) {
-                    accX += dx * speed;
-                    accY += dy * speed;
-                    int mx = (int) accX;
-                    int my = (int) accY;
-                    if (mx != 0 || my != 0) {
-                        accX -= mx;
-                        accY -= my;
-                        sendMove(mx, my, true);
-                    }
-                } else {
-                    accX += dx * speed;
-                    accY += dy * speed;
-                    int mx = (int) accX;
-                    int my = (int) accY;
-                    if (mx != 0 || my != 0) {
-                        accX -= mx;
-                        accY -= my;
-                        sendMove(mx, my, false);
-                    }
+                accX += dx * speed;
+                accY += dy * speed;
+                int mx = (int) accX;
+                int my = (int) accY;
+                if (mx != 0 || my != 0) {
+                    accX -= mx;
+                    accY -= my;
+                    sendMove(mx, my, false);
                 }
                 invalidate();
                 return true;
 
+            case MotionEvent.ACTION_POINTER_UP:
+                if (event.getPointerCount() == 2) {
+                    long duration = System.currentTimeMillis() - twoFingerDownAt;
+                    if (twoFingerMove < touchSlop && duration < 400) {
+                        if (listener != null) {
+                            listener.onSecondaryClick();
+                        }
+                        haptic(HapticFeedbackConstants.CONTEXT_CLICK);
+                    }
+                }
+                // Lock cursor movement when lifting multi-touch fingers to prevent jumping
+                return true;
+
             case MotionEvent.ACTION_UP:
-                cancelLongPressCallback();
-                boolean tap = !scrolling && !dragging && totalMove < touchSlop
-                        && System.currentTimeMillis() - downAt < 650;
-                if (dragging) {
-                    sendMove(0, 0, false);
-                    haptic(HapticFeedbackConstants.LONG_PRESS);
-                } else if (tap) {
+                boolean tap = !multiTouch && totalMove < touchSlop
+                        && System.currentTimeMillis() - downAt < 500;
+                if (tap) {
                     if (listener != null) {
                         listener.onClick();
                     }
@@ -265,21 +258,7 @@ public final class TrackpadView extends View {
                 return true;
 
             case MotionEvent.ACTION_CANCEL:
-                cancelLongPressCallback();
-                if (dragging) {
-                    sendMove(0, 0, false);
-                }
                 ending();
-                return true;
-
-            case MotionEvent.ACTION_POINTER_UP:
-                if (scrolling) {
-                    scrolling = false;
-                    int remaining = event.getActionIndex() == 0 ? 1 : 0;
-                    lastX = event.getX(remaining);
-                    lastY = event.getY(remaining);
-                    totalMove = touchSlop + 1;
-                }
                 return true;
 
             default:
@@ -289,31 +268,8 @@ public final class TrackpadView extends View {
 
     private void ending() {
         touching = false;
-        dragging = false;
-        scrolling = false;
-        cancelLongPressCallback();
+        multiTouch = false;
         invalidate();
-    }
-
-    private void scheduleLongPress() {
-        cancelLongPressCallback();
-        longPress = () -> {
-            if (!touching || scrolling) {
-                return;
-            }
-            dragging = true;
-            sendMove(0, 0, true);
-            haptic(HapticFeedbackConstants.LONG_PRESS);
-            invalidate();
-        };
-        handler.postDelayed(longPress, 480);
-    }
-
-    private void cancelLongPressCallback() {
-        if (longPress != null) {
-            handler.removeCallbacks(longPress);
-            longPress = null;
-        }
     }
 
     private void sendMove(int dx, int dy, boolean down) {

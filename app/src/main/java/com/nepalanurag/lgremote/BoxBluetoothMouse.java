@@ -90,6 +90,13 @@ public final class BoxBluetoothMouse {
             (byte) 0x75, (byte) 0x08, // Report size (8)
             (byte) 0x95, (byte) 0x03, // Report count (3)
             (byte) 0x81, (byte) 0x06, // Input (Data, Variable, Relative)
+            (byte) 0x05, (byte) 0x0C, // Usage page (Consumer)
+            (byte) 0x0A, (byte) 0x38, (byte) 0x02, // Usage (AC Pan)
+            (byte) 0x15, (byte) 0x81, // Logical minimum (-127)
+            (byte) 0x25, (byte) 0x7F, // Logical maximum (127)
+            (byte) 0x75, (byte) 0x08, // Report size (8)
+            (byte) 0x95, (byte) 0x01, // Report count (1)
+            (byte) 0x81, (byte) 0x06, // Input (Data, Variable, Relative)
             (byte) 0xC0,              // End Collection
             (byte) 0xC0               // End Collection
     };
@@ -104,7 +111,7 @@ public final class BoxBluetoothMouse {
                     BluetoothHidDeviceAppQosSettings.MAX)
             : null;
 
-    private final byte[] lastMouseReport = new byte[]{0, 0, 0, 0};
+    private final byte[] lastMouseReport = new byte[]{0, 0, 0, 0, 0};
 
     public interface Listener {
         void onBluetoothMouseStatusChanged();
@@ -395,7 +402,8 @@ public final class BoxBluetoothMouse {
     private boolean pendingButton = false;
     private long lastDispatchTime = 0;
     private boolean flushScheduled = false;
-    private float scrollAccum = 0f;
+    private float scrollAccumX = 0f;
+    private float scrollAccumY = 0f;
 
     private static final long DISPATCH_INTERVAL_MS = 10;
 
@@ -460,6 +468,7 @@ public final class BoxBluetoothMouse {
         lastMouseReport[1] = rx;
         lastMouseReport[2] = ry;
         lastMouseReport[3] = 0;
+        lastMouseReport[4] = 0;
         lastDispatchTime = now;
 
         try {
@@ -493,18 +502,53 @@ public final class BoxBluetoothMouse {
             accumY = 0f;
         }
         try {
-            // Immediate button 1 down with zero latency
+            // Immediate button 1 (left click) down with zero latency
             lastMouseReport[0] = 0x01;
             lastMouseReport[1] = 0;
             lastMouseReport[2] = 0;
             lastMouseReport[3] = 0;
-            boolean ok = hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x01, 0, 0, 0});
+            lastMouseReport[4] = 0;
+            boolean ok = hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x01, 0, 0, 0, 0});
             // Button 1 up after 15ms for crisp, instantaneous click response
             executor.schedule(() -> {
                 if (isConnected() && hasPermission()) {
                     try {
                         lastMouseReport[0] = 0x00;
-                        hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x00, 0, 0, 0});
+                        hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x00, 0, 0, 0, 0});
+                    } catch (SecurityException ignored) {
+                    }
+                }
+            }, 15, TimeUnit.MILLISECONDS);
+            return ok;
+        } catch (SecurityException e) {
+            return false;
+        }
+    }
+
+    public boolean sendRightClick() {
+        if (!isConnected() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !hasPermission()) {
+            return false;
+        }
+        synchronized (moveLock) {
+            pendingDx = 0;
+            pendingDy = 0;
+            accumX = 0f;
+            accumY = 0f;
+        }
+        try {
+            // Immediate button 2 (right click) down
+            lastMouseReport[0] = 0x02;
+            lastMouseReport[1] = 0;
+            lastMouseReport[2] = 0;
+            lastMouseReport[3] = 0;
+            lastMouseReport[4] = 0;
+            boolean ok = hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x02, 0, 0, 0, 0});
+            // Button 2 up after 15ms
+            executor.schedule(() -> {
+                if (isConnected() && hasPermission()) {
+                    try {
+                        lastMouseReport[0] = 0x00;
+                        hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x00, 0, 0, 0, 0});
                     } catch (SecurityException ignored) {
                     }
                 }
@@ -519,20 +563,26 @@ public final class BoxBluetoothMouse {
         if (!isConnected() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !hasPermission()) {
             return false;
         }
-        // Invert dy for natural scrolling (swiping fingers up pushes content up / scrolls down)
-        scrollAccum += (-dy) * 0.45f;
-        int wheelClicks = (int) scrollAccum;
-        if (wheelClicks == 0) {
+        // Natural 2D scrolling: swipe up (dy > 0) scrolls down (-dy); swipe left (dx < 0) scrolls right (dx)
+        scrollAccumX += dx * 0.5f;
+        scrollAccumY += (-dy) * 0.5f;
+        int wheelH = (int) scrollAccumX;
+        int wheelV = (int) scrollAccumY;
+        if (wheelH == 0 && wheelV == 0) {
             return true;
         }
-        scrollAccum -= wheelClicks;
-        byte wheel = (byte) Math.max(-127, Math.min(127, wheelClicks));
+        scrollAccumX -= wheelH;
+        scrollAccumY -= wheelV;
+        byte rxWheelH = (byte) Math.max(-127, Math.min(127, wheelH));
+        byte rxWheelV = (byte) Math.max(-127, Math.min(127, wheelV));
         lastMouseReport[0] = 0;
         lastMouseReport[1] = 0;
         lastMouseReport[2] = 0;
-        lastMouseReport[3] = wheel;
+        lastMouseReport[3] = rxWheelV;
+        lastMouseReport[4] = rxWheelH;
         try {
-            return hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0, 0, 0, wheel});
+            return hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE,
+                    new byte[]{0, 0, 0, rxWheelV, rxWheelH});
         } catch (SecurityException e) {
             return false;
         }

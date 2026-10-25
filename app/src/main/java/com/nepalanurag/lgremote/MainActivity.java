@@ -1043,6 +1043,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                     service.sendScroll(dx, dy);
                 }
             }
+
+            @Override
+            public void onSecondaryClick() {
+                if (service != null) {
+                    service.sendSecondaryClick();
+                }
+            }
         });
         board.addView(trackpad, new LinearLayout.LayoutParams(0, size, 1f));
         keyControls.add(trackpad);
@@ -1166,6 +1173,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             public void onScroll(int dx, int dy) {
                 if (service != null) {
                     service.sendScroll(dx, dy);
+                }
+            }
+
+            @Override
+            public void onSecondaryClick() {
+                if (service != null) {
+                    service.sendSecondaryClick();
                 }
             }
         });

@@ -589,6 +589,13 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         return client.sendClick();
     }
 
+    public boolean sendSecondaryClick() {
+        if (isBoxActive()) {
+            return boxMouse != null && boxMouse.sendRightClick();
+        }
+        return false;
+    }
+
     public boolean sendMove(int dx, int dy, boolean down) {
         if (isBoxActive()) {
             return boxMouse != null && boxMouse.sendMove(dx, dy, down);
