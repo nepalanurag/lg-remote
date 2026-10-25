@@ -22,7 +22,6 @@ Java only. Package `com.nepalanurag.lgremote`. Minimum Android 8.0 (API 26), tar
 **Controls the Android TV box**
 - Pairing over the Google TV / Android TV Remote protocol v2
 - D-pad, OK, Back, Home, Settings, playback keys
-- Swipe pad mode: smooth swipe gestures map to discrete D-pad navigation (Up/Down/Left/Right), tap to select (OK)
 - Text entry, delete and Enter through the Android TV remote IME
 - mDNS discovery, with a saved host tried first and manual IP as the fallback
 
