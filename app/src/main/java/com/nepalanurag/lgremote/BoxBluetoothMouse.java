@@ -106,8 +106,13 @@ public final class BoxBluetoothMouse {
         public void onAppStatusChanged(BluetoothDevice pluggedDevice, boolean registered) {
             Log.d(TAG, "Bluetooth HID app status changed: registered=" + registered);
             BoxBluetoothMouse.this.registered = registered;
-            if (registered && pluggedDevice != null) {
-                connectedDevice = pluggedDevice;
+            if (registered) {
+                if (pluggedDevice != null) {
+                    connectedDevice = pluggedDevice;
+                    SecureStore.setBoxBtMac(context, pluggedDevice.getAddress());
+                } else {
+                    autoConnect();
+                }
             }
             notifyListener();
         }
@@ -124,6 +129,9 @@ public final class BoxBluetoothMouse {
             Log.d(TAG, "Bluetooth HID connection state: device=" + deviceName + " state=" + state);
             if (state == BluetoothProfile.STATE_CONNECTED) {
                 connectedDevice = device;
+                if (device != null) {
+                    SecureStore.setBoxBtMac(context, device.getAddress());
+                }
             } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
                 if (connectedDevice != null && connectedDevice.equals(device)) {
                     connectedDevice = null;
@@ -213,6 +221,74 @@ public final class BoxBluetoothMouse {
             } catch (SecurityException e) {
                 Log.w(TAG, "Cannot get BluetoothHidDevice proxy: " + e.getMessage());
             }
+        } else if (registered) {
+            autoConnect();
+        }
+    }
+
+    public boolean connect(BluetoothDevice device) {
+        if (device == null || hidDevice == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !hasPermission()) {
+            return false;
+        }
+        try {
+            boolean initiated = hidDevice.connect(device);
+            Log.d(TAG, "Bluetooth HID connect to " + device.getAddress() + " initiated: " + initiated);
+            if (initiated) {
+                SecureStore.setBoxBtMac(context, device.getAddress());
+            }
+            return initiated;
+        } catch (SecurityException e) {
+            Log.w(TAG, "Cannot initiate Bluetooth HID connect: " + e.getMessage());
+            return false;
+        }
+    }
+
+    public boolean connect(String address) {
+        if (address == null || address.isEmpty() || adapter == null) {
+            return false;
+        }
+        try {
+            return connect(adapter.getRemoteDevice(address));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public void autoConnect() {
+        if (connectedDevice != null || hidDevice == null || !registered || !hasPermission() || adapter == null) {
+            return;
+        }
+        String savedMac = SecureStore.getBoxBtMac(context);
+        if (!savedMac.isEmpty()) {
+            try {
+                BluetoothDevice dev = adapter.getRemoteDevice(savedMac);
+                if (dev != null) {
+                    connect(dev);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public void disconnect() {
+        if (connectedDevice != null && hidDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hasPermission()) {
+            try {
+                hidDevice.disconnect(connectedDevice);
+            } catch (SecurityException ignored) {
+            }
+            connectedDevice = null;
+            notifyListener();
+        }
+    }
+
+    public java.util.Set<BluetoothDevice> getBondedDevices() {
+        if (adapter == null || !hasPermission()) {
+            return java.util.Collections.emptySet();
+        }
+        try {
+            return adapter.getBondedDevices();
+        } catch (SecurityException ignored) {
+            return java.util.Collections.emptySet();
         }
     }
 

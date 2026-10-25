@@ -43,6 +43,12 @@ import android.widget.SeekBar;
 import android.widget.Space;
 import android.widget.Switch;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.provider.Settings;
+import android.widget.ArrayAdapter;
+import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -133,6 +139,9 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             service = ((RemoteService.LocalBinder) binder).service();
             bound = true;
             service.addListener(MainActivity.this);
+            if (service.getBoxMouse() != null) {
+                service.getBoxMouse().autoConnect();
+            }
             if (service.getIp() != null && !setupVisible) {
                 showRemote();
             }
@@ -1832,43 +1841,186 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         service.sendClick();
     }
 
+    @SuppressWarnings("MissingPermission")
     private void showBluetoothMousePairDialog() {
         ensureBluetoothPermission();
-        String phoneName = "this phone";
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
-                || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
-            BluetoothAdapter bt = BluetoothAdapter.getDefaultAdapter();
+        BluetoothAdapter bt = BluetoothAdapter.getDefaultAdapter();
+        if (bt == null || !bt.isEnabled()) {
+            toast("Bluetooth is turned off");
+            return;
+        }
+
+        List<BluetoothDevice> deviceList = new ArrayList<>();
+        List<String> displayList = new ArrayList<>();
+        ArrayAdapter<String> listAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, displayList);
+
+        // Pre-populate already bonded devices
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
             try {
-                if (bt != null && bt.getName() != null) {
-                    phoneName = bt.getName();
+                for (BluetoothDevice dev : bt.getBondedDevices()) {
+                    if (dev != null && !deviceList.contains(dev)) {
+                        deviceList.add(dev);
+                        String name = dev.getName();
+                        displayList.add("📺 " + (name != null ? name : dev.getAddress()) + " (Paired)");
+                    }
                 }
             } catch (SecurityException ignored) {
             }
         }
-        new AlertDialog.Builder(this)
-                .setTitle("Android TV Mouse")
-                .setMessage("To control the cursor on your Android TV box, pair this phone as a Bluetooth mouse:\n\n"
-                        + "1. On Android TV, open Settings → Remotes & Accessories.\n"
-                        + "2. Choose 'Add accessory' or 'Pair remote'.\n"
-                        + "3. Tap 'Make Discoverable' below.\n"
-                        + "4. Select '" + phoneName + "' on your TV screen.")
-                .setPositiveButton("Make Discoverable", (dialog, which) -> {
-                    BoxBluetoothMouse.requestDiscoverable(this);
-                    if (service != null && service.getBoxMouse() != null) {
-                        service.getBoxMouse().start();
+        if (displayList.isEmpty()) {
+            displayList.add("Scanning for nearby devices...");
+        }
+        listAdapter.notifyDataSetChanged();
+
+        AlertDialog[] dialogHolder = new AlertDialog[1];
+
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+                if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                    BluetoothDevice dev = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                    if (dev != null && !deviceList.contains(dev)) {
+                        if (displayList.size() == 1 && "Scanning for nearby devices...".equals(displayList.get(0))) {
+                            displayList.clear();
+                        }
+                        deviceList.add(dev);
+                        String name = null;
+                        try {
+                            name = dev.getName();
+                        } catch (SecurityException ignored) {
+                        }
+                        displayList.add("🔍 " + (name != null ? name : dev.getAddress()));
+                        listAdapter.notifyDataSetChanged();
                     }
+                } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(action)) {
+                    int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR);
+                    if (state == BluetoothDevice.BOND_BONDED) {
+                        BluetoothDevice dev = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                        if (dev != null && service != null && service.getBoxMouse() != null) {
+                            service.getBoxMouse().connect(dev);
+                            String name = null;
+                            try {
+                                name = dev.getName();
+                            } catch (SecurityException ignored) {
+                            }
+                            toast("Connected mouse to " + (name != null ? name : dev.getAddress()) + "!");
+                            if (dialogHolder[0] != null) {
+                                dialogHolder[0].dismiss();
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothDevice.ACTION_FOUND);
+        filter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+        registerReceiver(receiver, filter);
+
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            try {
+                bt.startDiscovery();
+            } catch (SecurityException ignored) {
+            }
+        }
+
+        LinearLayout container = new LinearLayout(this);
+        container.setOrientation(LinearLayout.VERTICAL);
+        int pad = (int) (18 * getResources().getDisplayMetrics().density);
+        container.setPadding(pad, pad / 2, pad, pad / 2);
+
+        TextView info = new TextView(this);
+        info.setText("Android TV hides phones from its accessory search list.\n\n"
+                + "1. Keep TV on 'Searching for accessories'.\n"
+                + "2. Tap your TV box below.\n"
+                + "3. Accept 'Pair' on your TV screen.");
+        info.setTextColor(getColor(R.color.muted));
+        info.setTextSize(13);
+        info.setLineSpacing(0, 1.25f);
+        info.setPadding(0, 0, 0, pad / 2);
+        container.addView(info);
+
+        ListView listView = new ListView(this);
+        listView.setAdapter(listAdapter);
+        listView.setDividerHeight(1);
+        container.addView(listView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (220 * getResources().getDisplayMetrics().density)));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Pair Android TV Mouse")
+                .setView(container)
+                .setPositiveButton("Bluetooth Settings", (d, which) -> {
+                    startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
+                })
+                .setNeutralButton("Make Discoverable", (d, which) -> {
+                    BoxBluetoothMouse.requestDiscoverable(this);
                 })
                 .setNegativeButton(android.R.string.cancel, null)
-                .show();
+                .create();
+
+        dialogHolder[0] = dialog;
+
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= deviceList.size()) {
+                return;
+            }
+            BluetoothDevice target = deviceList.get(position);
+            int bond = BluetoothDevice.BOND_NONE;
+            try {
+                bond = target.getBondState();
+            } catch (SecurityException ignored) {
+            }
+            if (bond == BluetoothDevice.BOND_BONDED) {
+                if (service != null && service.getBoxMouse() != null) {
+                    service.getBoxMouse().connect(target);
+                    String name = null;
+                    try {
+                        name = target.getName();
+                    } catch (SecurityException ignored) {
+                    }
+                    toast("Connecting mouse to " + (name != null ? name : target.getAddress()) + "...");
+                }
+                dialog.dismiss();
+            } else {
+                try {
+                    target.createBond();
+                    toast("Pairing request sent! Accept prompt on your TV screen...");
+                } catch (SecurityException e) {
+                    toast("Pairing failed: " + e.getMessage());
+                }
+            }
+        });
+
+        dialog.setOnDismissListener(d -> {
+            try {
+                unregisterReceiver(receiver);
+            } catch (Exception ignored) {
+            }
+            try {
+                bt.cancelDiscovery();
+            } catch (SecurityException ignored) {
+            }
+        });
+
+        dialog.show();
     }
 
     private void ensureBluetoothPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            List<String> needed = new ArrayList<>();
             if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                        Manifest.permission.BLUETOOTH_ADVERTISE
-                }, 102);
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT);
+            }
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_ADVERTISE);
+            }
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_SCAN);
+            }
+            if (!needed.isEmpty()) {
+                requestPermissions(needed.toArray(new String[0]), 102);
             }
         }
     }
@@ -2412,12 +2564,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 .setTitle(R.string.box_section)
                 .setItems(new String[]{
                         getString(R.string.wake_box_cec),
+                        "Pair / Connect Bluetooth Mouse",
                         getString(R.string.box_pair_again),
                         getString(R.string.forget_pairing)}, (dialog, which) -> {
                     settings.dismiss();
                     if (which == 0) {
                         wakeBoxCec(true);
                     } else if (which == 1) {
+                        showBluetoothMousePairDialog();
+                    } else if (which == 2) {
                         beginBoxPairing();
                     } else {
                         confirmForgetBox();
