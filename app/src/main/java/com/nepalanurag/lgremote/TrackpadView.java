@@ -23,6 +23,9 @@ public final class TrackpadView extends View {
         void onClick();
 
         void onScroll(int dx, int dy);
+
+        default void onSwipe(String direction) {
+        }
     }
 
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -39,6 +42,10 @@ public final class TrackpadView extends View {
     private Listener listener;
     private float speed = 1.6f;
     private boolean haptics = true;
+    private boolean swipeMode;
+    private float swipeAccumX;
+    private float swipeAccumY;
+    private boolean swipedThisTouch;
     private boolean touching;
     private boolean dragging;
     private boolean scrolling;
@@ -109,6 +116,17 @@ public final class TrackpadView extends View {
         haptics = enabled;
     }
 
+    public void setSwipeMode(boolean swipeMode) {
+        if (this.swipeMode != swipeMode) {
+            this.swipeMode = swipeMode;
+            invalidate();
+        }
+    }
+
+    public boolean isSwipeMode() {
+        return swipeMode;
+    }
+
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         panel.set(Ui.dp(getContext(), 1), Ui.dp(getContext(), 1),
@@ -124,25 +142,27 @@ public final class TrackpadView extends View {
         stroke.setColor(getContext().getColor(touching ? R.color.accent_dim : R.color.stroke));
         canvas.drawRoundRect(panel, radius, radius, stroke);
 
-        canvas.drawText("TRACKPAD", Ui.dp(getContext(), 18),
+        canvas.drawText(swipeMode ? "SWIPE PAD" : "TRACKPAD", Ui.dp(getContext(), 18),
                 Ui.dp(getContext(), 26), tag);
 
         if (!touching) {
             float midY = getHeight() / 2f;
-            canvas.drawText(getContext().getString(R.string.trackpad_hint),
-                    getWidth() / 2f, midY - Ui.dp(getContext(), 4), hint);
-            String[] lines = getContext().getString(R.string.trackpad_sub).split("\n");
-            float y = midY + Ui.dp(getContext(), 20);
-            for (String line : lines) {
-                canvas.drawText(line, getWidth() / 2f, y, sub);
-                y += Ui.dp(getContext(), 17);
+            float midX = getWidth() / 2f;
+            if (swipeMode) {
+                canvas.drawText("Swipe to navigate", midX, midY - Ui.dp(getContext(), 4), hint);
+                canvas.drawText("Tap to select", midX, midY + Ui.dp(getContext(), 18), sub);
+            } else {
+                canvas.drawText(getContext().getString(R.string.trackpad_hint),
+                        midX, midY - Ui.dp(getContext(), 4), hint);
+                canvas.drawText("Tap to click", midX, midY + Ui.dp(getContext(), 18), sub);
             }
         } else {
             canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), 20), dotGlow);
             canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), dragging ? 7 : 5), dot);
-            String state = dragging ? "Drag · release to drop" : "Tap to click";
-            canvas.drawText(state, getWidth() / 2f,
-                    getHeight() - Ui.dp(getContext(), 22), sub);
+            if (dragging) {
+                canvas.drawText("Drag · release to drop", getWidth() / 2f,
+                        getHeight() - Ui.dp(getContext(), 22), sub);
+            }
         }
     }
 
@@ -157,13 +177,18 @@ public final class TrackpadView extends View {
                 touching = true;
                 dragging = false;
                 scrolling = false;
+                swipedThisTouch = false;
+                swipeAccumX = 0;
+                swipeAccumY = 0;
                 downX = lastX = dotX = event.getX();
                 downY = lastY = dotY = event.getY();
                 totalMove = 0;
                 downAt = System.currentTimeMillis();
                 accX = 0;
                 accY = 0;
-                scheduleLongPress();
+                if (!swipeMode) {
+                    scheduleLongPress();
+                }
                 invalidate();
                 return true;
 
@@ -196,7 +221,21 @@ public final class TrackpadView extends View {
                     if (sx != 0 || sy != 0) {
                         scrollAccX -= sx;
                         scrollAccY -= sy;
-                        if (listener != null) {
+                        if (swipeMode) {
+                            float scrollThreshold = Ui.dp(getContext(), 16);
+                            if (Math.abs(sy) >= scrollThreshold || Math.abs(sx) >= scrollThreshold) {
+                                String dir;
+                                if (Math.abs(sy) >= Math.abs(sx)) {
+                                    dir = sy > 0 ? "UP" : "DOWN";
+                                } else {
+                                    dir = sx > 0 ? "RIGHT" : "LEFT";
+                                }
+                                if (listener != null) {
+                                    listener.onSwipe(dir);
+                                }
+                                haptic(HapticFeedbackConstants.KEYBOARD_TAP);
+                            }
+                        } else if (listener != null) {
                             listener.onScroll(sx, sy);
                         }
                     }
@@ -213,6 +252,28 @@ public final class TrackpadView extends View {
                 dotX = x;
                 dotY = y;
                 if (totalMove < touchSlop) {
+                    invalidate();
+                    return true;
+                }
+                if (swipeMode) {
+                    swipeAccumX += dx;
+                    swipeAccumY += dy;
+                    float threshold = Ui.dp(getContext(), 38);
+                    if (Math.abs(swipeAccumX) >= threshold || Math.abs(swipeAccumY) >= threshold) {
+                        String dir;
+                        if (Math.abs(swipeAccumX) >= Math.abs(swipeAccumY)) {
+                            dir = swipeAccumX > 0 ? "RIGHT" : "LEFT";
+                        } else {
+                            dir = swipeAccumY > 0 ? "DOWN" : "UP";
+                        }
+                        swipeAccumX = 0;
+                        swipeAccumY = 0;
+                        swipedThisTouch = true;
+                        if (listener != null) {
+                            listener.onSwipe(dir);
+                        }
+                        haptic(HapticFeedbackConstants.KEYBOARD_TAP);
+                    }
                     invalidate();
                     return true;
                 }
@@ -252,6 +313,21 @@ public final class TrackpadView extends View {
                         listener.onClick();
                     }
                     haptic(HapticFeedbackConstants.KEYBOARD_TAP);
+                } else if (swipeMode && !swipedThisTouch) {
+                    float netX = event.getX() - downX;
+                    float netY = event.getY() - downY;
+                    if (Math.hypot(netX, netY) >= touchSlop * 1.5f) {
+                        String dir;
+                        if (Math.abs(netX) >= Math.abs(netY)) {
+                            dir = netX > 0 ? "RIGHT" : "LEFT";
+                        } else {
+                            dir = netY > 0 ? "DOWN" : "UP";
+                        }
+                        if (listener != null) {
+                            listener.onSwipe(dir);
+                        }
+                        haptic(HapticFeedbackConstants.KEYBOARD_TAP);
+                    }
                 }
                 ending();
                 return true;
@@ -283,6 +359,9 @@ public final class TrackpadView extends View {
         touching = false;
         dragging = false;
         scrolling = false;
+        swipedThisTouch = false;
+        swipeAccumX = 0;
+        swipeAccumY = 0;
         cancelLongPressCallback();
         invalidate();
     }

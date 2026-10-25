@@ -1017,7 +1017,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         trackpad.setListener(new TrackpadView.Listener() {
             @Override
             public void onMove(int dx, int dy, boolean buttonDown) {
-                if (service != null) {
+                if (service != null && !service.isBoxActive()) {
                     service.sendMove(dx, dy, buttonDown);
                 }
             }
@@ -1029,11 +1029,17 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
             @Override
             public void onScroll(int dx, int dy) {
-                if (service != null) {
+                if (service != null && !service.isBoxActive()) {
                     service.sendScroll(dx, dy);
                 }
             }
+
+            @Override
+            public void onSwipe(String direction) {
+                sendButton(direction);
+            }
         });
+        updateTrackpadMode();
         board.addView(trackpad, new LinearLayout.LayoutParams(0, size, 1f));
         keyControls.add(trackpad);
 
@@ -1142,7 +1148,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         trackpad.setListener(new TrackpadView.Listener() {
             @Override
             public void onMove(int dx, int dy, boolean buttonDown) {
-                if (service != null) {
+                if (service != null && !service.isBoxActive()) {
                     service.sendMove(dx, dy, buttonDown);
                 }
             }
@@ -1154,11 +1160,17 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
             @Override
             public void onScroll(int dx, int dy) {
-                if (service != null) {
+                if (service != null && !service.isBoxActive()) {
                     service.sendScroll(dx, dy);
                 }
             }
+
+            @Override
+            public void onSwipe(String direction) {
+                sendButton(direction);
+            }
         });
+        updateTrackpadMode();
         panel.addView(trackpad, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, height));
         keyControls.add(trackpad);
@@ -1205,6 +1217,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (!buttons) {
             trackpad.setPointerSpeed(SecureStore.getPointerSpeed(this));
             trackpad.setHaptics(SecureStore.getHaptics(this));
+            updateTrackpadMode();
+        }
+    }
+
+    private void updateTrackpadMode() {
+        if (trackpad != null) {
+            trackpad.setSwipeMode(service != null && service.isBoxActive());
         }
     }
 
@@ -1428,6 +1447,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 break;
         }
         refreshEnabled();
+        updateTrackpadMode();
         if (!setupVisible) {
             remoteView.setVisibility(View.VISIBLE);
             setupView.setVisibility(View.GONE);
