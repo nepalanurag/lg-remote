@@ -13,7 +13,7 @@
     <string name="connect">Connect</string>
     <string name="invalid_ip">Enter a valid IPv4 address, like 192.168.1.42.</string>
     <string name="setup_help_title">One-time TV setup</string>
-    <string name="setup_help">1. On the TV: Settings → All Settings → General → External Devices → TV On With Mobile, and turn on “Turn on via Wi-Fi”.\n\n2. Keep the phone and TV on the same Wi-Fi network.\n\n3. The first time you connect, the TV asks you to allow “LG Remote App”. Accept it once; the pairing is remembered.\n\nOnly the local network is used. The app never sends your TV details anywhere.</string>
+    <string name="setup_help">1. On the TV: Settings → All Settings → General → External Devices → TV On With Mobile, and turn on “Turn on via Wi-Fi”.\n\n2. Keep the phone and TV on the same Wi-Fi network.\n\n3. The first time you connect, the TV shows a one-time PIN. Enter it here — no TV remote needed. The pairing is remembered.\n\nOnly the local network is used. The app never sends your TV details anywhere.</string>
 
     <string name="buttons">Buttons</string>
     <string name="trackpad">Trackpad</string>
@@ -38,10 +38,20 @@
     <string name="not_connected">Not connected</string>
     <string name="connected">Connected</string>
     <string name="connecting">Connecting…</string>
-    <string name="pairing">Approve the connection on your TV.</string>
+    <string name="pairing">Enter the PIN shown on your TV.</string>
     <string name="pairing_banner">Approve the “LG Remote App” request on your TV. You only have to do this once.</string>
-    <string name="pairing_timeout">No answer from the TV. Accept the request on the TV, then retry.</string>
-    <string name="pairing_denied">Pairing was not approved. On the TV, accept the request and try again.</string>
+    <string name="pairing_timeout">The PIN request timed out. Tap Retry for a new PIN.</string>
+    <string name="pairing_denied">Pairing was not approved. Tap Retry for a new PIN.</string>
+    <string name="pairing_pin_title">Pair with your LG TV</string>
+    <string name="pairing_pin_body">Your TV is showing a one-time PIN. Enter it here to finish pairing — no TV remote needed.</string>
+    <string name="pairing_pin_hint">PIN</string>
+    <string name="pairing_pin_hint_help">Use the number pad above. The PIN appears on the TV when pairing starts.</string>
+    <string name="pairing_pin_confirm">Pair</string>
+    <string name="pairing_pin_checking">Checking…</string>
+    <string name="pairing_pin_invalid">Enter the 4–8 digit PIN shown on the TV.</string>
+    <string name="pairing_pin_header">Enter TV PIN</string>
+    <string name="pairing_pin_banner">Your TV is showing a pairing PIN. Enter it on your phone to finish.</string>
+    <string name="pairing_pin_open">Enter PIN</string>
     <string name="remote_offline">Remote offline</string>
     <string name="tv_not_ready">The TV is not ready yet. Give it a moment and try again.</string>
     <string name="power_off_title">Turn off the TV?</string>
@@ -55,8 +65,11 @@
     <string name="no_apps">No apps reported by the TV.</string>
     <string name="no_inputs">No inputs reported by the TV.</string>
     <string name="loading_apps">Reading the TV’s app list…</string>
+    <string name="loading_tv_apps">Reading the LG TV’s app list…</string>
     <string name="loading_inputs">Reading the TV’s inputs…</string>
     <string name="open_app_title">Open an app</string>
+    <string name="open_tv_apps_title">LG TV apps</string>
+    <string name="tv_apps">LG apps</string>
     <string name="inputs_title">Choose an input</string>
     <string name="settings_title">Settings</string>
     <string name="current_tv">CURRENT TV</string>
@@ -76,7 +89,7 @@
     <string name="haptics_help">A light tap when you press a button or click the trackpad.</string>
     <string name="forget_pairing">Forget pairing</string>
     <string name="forget_title">Forget this TV?</string>
-    <string name="forget_body">The saved client key is deleted. The next connection asks you to approve the TV prompt again.</string>
+    <string name="forget_body">The saved client key is deleted. The next connection asks for a new PIN shown on the TV.</string>
     <string name="forget_confirm">Forget</string>
     <string name="forgotten">Pairing forgotten. Connect again to re-pair.</string>
     <string name="tv_help">TV setup help</string>
@@ -86,6 +99,8 @@
     <string name="notification_connected">Connected to %1$s</string>
     <string name="notification_connecting">Connecting to %1$s</string>
     <string name="notification_pairing">Approve the remote on your TV</string>
+    <string name="notification_pairing_pin">Enter the pairing PIN</string>
+    <string name="notification_pairing_pin_detail">Open LG Remote and enter the PIN shown on your TV.</string>
     <string name="notification_reconnecting">Reconnecting to %1$s</string>
     <string name="notification_offline">Remote offline</string>
     <string name="notification_ready">Remote ready · %1$s</string>
@@ -96,7 +111,7 @@
     <string name="change_tv_help">Choose another TV on your network. The current pairing stays saved.</string>
     <string name="tv_found">%1$d found on this Wi-Fi. Tap yours to connect.</string>
     <string name="paired_keystore">Paired · client key kept in the Android Keystore</string>
-    <string name="paired_none">Not paired yet · the TV asks once on the next connect</string>
+    <string name="paired_none">Not paired yet · the TV shows a PIN on the next connect</string>
     <string name="settings_ip">IP address</string>
     <string name="settings_model">Model</string>
     <string name="disconnected_banner">The remote is disconnected.</string>
@@ -155,18 +170,19 @@
     <string name="box_input_loading">Reading the TV’s inputs… Try again in a moment.</string>
 
     <string name="tv_keyboard_section">TYPE ON TV</string>
+    <string name="tv_keyboard_box_section">TYPE ON BOX</string>
     <string name="tv_keyboard_hint">Text for the active screen…</string>
-    <string name="tv_keyboard_help">Select a text field on the TV. The keyboard opens here automatically, ready to type.</string>
-    <string name="tv_keyboard_box_help">Select a search or message field on the box. The keyboard opens here automatically; text is sent through the Android TV remote IME.</string>
+    <string name="tv_keyboard_help">Select a text field on the TV. The keyboard opens here and text is sent automatically as you type. Backspace deletes in this draft and on the TV once the character has been sent; use Enter only if the app needs it.</string>
+    <string name="tv_keyboard_box_help">Select a search or message field on the box. The keyboard opens here and text is sent automatically as you type through the Android TV remote IME. Backspace deletes in this draft and on the box once the character has been sent.</string>
     <string name="tv_keyboard_box_unpaired">Pair the Android TV box to type on its apps while this input is active.</string>
     <string name="tv_keyboard_offline">Connect to the TV to type on it.</string>
     <string name="tv_keyboard_send">Send text</string>
     <string name="tv_keyboard_delete">Delete a character</string>
     <string name="tv_keyboard_enter">Press enter</string>
     <string name="tv_keyboard_empty">Type some text first.</string>
-    <string name="tv_keyboard_failed">The TV did not accept the text. Tap its text field first.</string>
+    <string name="tv_keyboard_failed">The active screen did not accept the text. Tap its text field first.</string>
     <string name="tv_keyboard_not_focused">Tap a text field on the TV first.</string>
-    <string name="device_settings">TV settings</string>
+    <string name="device_settings">Device settings</string>
     <string name="opening_tv_settings">Opening TV settings…</string>
     <string name="settings_not_ready">Connect to the TV first.</string>
     <string name="tv_power_status">TV power status</string>

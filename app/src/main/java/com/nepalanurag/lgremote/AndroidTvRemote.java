@@ -75,19 +75,19 @@ public final class AndroidTvRemote {
     private static final int REQUESTED_FEATURES =
             FEATURE_PING | FEATURE_KEY | FEATURE_IME | FEATURE_POWER | FEATURE_VOLUME
                     | FEATURE_APP_LINK;
-    private static final int KEYCODE_HOME = 3;
+    static final int KEYCODE_HOME = 3;
     private static final int KEYCODE_BACK = 4;
     private static final int KEYCODE_DPAD_UP = 19;
     private static final int KEYCODE_DPAD_DOWN = 20;
     private static final int KEYCODE_DPAD_LEFT = 21;
     private static final int KEYCODE_DPAD_RIGHT = 22;
     private static final int KEYCODE_DPAD_CENTER = 23;
-    private static final int KEYCODE_ENTER = 66;
-    private static final int KEYCODE_DEL = 67;
+    static final int KEYCODE_ENTER = 66;
+    static final int KEYCODE_DEL = 67;
     private static final int KEYCODE_MEDIA_PLAY_PAUSE = 85;
     private static final int KEYCODE_MEDIA_REWIND = 89;
     private static final int KEYCODE_MEDIA_FAST_FORWARD = 90;
-    private static final int KEYCODE_SETTINGS = 176;
+    static final int KEYCODE_SETTINGS = 176;
     private static final int DIRECTION_SHORT = 3;
 
     private static final ExecutorService IO = Executors.newCachedThreadPool();
@@ -161,13 +161,9 @@ public final class AndroidTvRemote {
 
         public void close() {
             closed = true;
-            SSLSocket current = socket;
-            if (current != null) {
-                try {
-                    current.close();
-                } catch (IOException ignored) {
-                }
-            }
+            // The close is sent to a background thread because a TLS close is network I/O and
+            // this can be called from the main thread.
+            closeQuietly(socket);
         }
 
         private void begin() {
@@ -357,69 +353,64 @@ public final class AndroidTvRemote {
      * Volume and mute stay with the TV and are intentionally not handled here.
      */
     public static void sendNavigation(Context context, String name, ResultCallback callback) {
-        int code;
-        String label;
-        switch (name) {
-            case "UP":
-                code = KEYCODE_DPAD_UP;
-                label = "Up";
-                break;
-            case "DOWN":
-                code = KEYCODE_DPAD_DOWN;
-                label = "Down";
-                break;
-            case "LEFT":
-                code = KEYCODE_DPAD_LEFT;
-                label = "Left";
-                break;
-            case "RIGHT":
-                code = KEYCODE_DPAD_RIGHT;
-                label = "Right";
-                break;
-            case "ENTER":
-                code = KEYCODE_DPAD_CENTER;
-                label = "OK";
-                break;
-            case "BACK":
-                code = KEYCODE_BACK;
-                label = "Back";
-                break;
-            case "PLAY":
-                code = KEYCODE_MEDIA_PLAY_PAUSE;
-                label = "Play/pause";
-                break;
-            case "REWIND":
-                code = KEYCODE_MEDIA_REWIND;
-                label = "Rewind";
-                break;
-            case "FASTFORWARD":
-                code = KEYCODE_MEDIA_FAST_FORWARD;
-                label = "Forward";
-                break;
-            default:
-                postResult(callback, false, "That button is not sent to the Android TV box.");
-                return;
-        }
-        sendKey(context, code, label, callback);
-    }
-
-    /** Sends typed text to the box's focused field using the Android TV IME protocol. */
-    public static void sendText(Context context, String text, ResultCallback callback) {
-        if (text == null || text.isEmpty()) {
-            postResult(callback, false, "Type some text first.");
+        int code = keyCodeFor(name);
+        if (code == 0) {
+            postResult(callback, false, "That button is not sent to the Android TV box.");
             return;
         }
-        withBoxHost(context, (host) -> sendTextTo(context, host, text), callback);
+        sendKey(context, code, labelFor(name), callback);
     }
 
-    /** Sends delete to the box's focused text field. */
-    public static void sendDelete(Context context, ResultCallback callback) {
-        sendKey(context, KEYCODE_DEL, "Delete", callback);
+    /** The Android key code for a remote button, or 0 when the box does not take that button. */
+    static int keyCodeFor(String name) {
+        switch (name) {
+            case "UP":
+                return KEYCODE_DPAD_UP;
+            case "DOWN":
+                return KEYCODE_DPAD_DOWN;
+            case "LEFT":
+                return KEYCODE_DPAD_LEFT;
+            case "RIGHT":
+                return KEYCODE_DPAD_RIGHT;
+            case "ENTER":
+                return KEYCODE_DPAD_CENTER;
+            case "BACK":
+                return KEYCODE_BACK;
+            case "PLAY":
+                return KEYCODE_MEDIA_PLAY_PAUSE;
+            case "REWIND":
+                return KEYCODE_MEDIA_REWIND;
+            case "FASTFORWARD":
+                return KEYCODE_MEDIA_FAST_FORWARD;
+            default:
+                return 0;
+        }
     }
 
-    /** Sends enter to the box's focused text field. */
-    public static void sendEnter(Context context, ResultCallback callback) {
-        sendKey(context, KEYCODE_ENTER, "Enter", callback);
+    /** The name used in messages for a remote button. */
+    static String labelFor(String name) {
+        switch (name) {
+            case "UP":
+                return "Up";
+            case "DOWN":
+                return "Down";
+            case "LEFT":
+                return "Left";
+            case "RIGHT":
+                return "Right";
+            case "ENTER":
+                return "OK";
+            case "BACK":
+                return "Back";
+            case "PLAY":
+                return "Play/pause";
+            case "REWIND":
+                return "Rewind";
+            case "FASTFORWARD":
+                return "Forward";
+            default:
+                return name;
+        }
     }
 
     /** Notified on the main thread when a text field on the box gains or loses focus. */
@@ -459,6 +450,25 @@ public final class AndroidTvRemote {
         }
     }
 
+    /** True when the persistent box session is connected and can carry keys and text. */
+    public static boolean isMonitorReady() {
+        TextMonitor current = textMonitor;
+        return current != null && current.isReady();
+    }
+
+    /**
+     * Sends one key over the persistent box session. The box only listens to the remote session
+     * that is currently active, so keys and text have to travel on the same connection.
+     */
+    public static void sendMonitoredKey(int keyCode, String label, ResultCallback callback) {
+        TextMonitor current = textMonitor;
+        if (current == null) {
+            postResult(callback, false, "The box connection is not ready.");
+            return;
+        }
+        current.sendKey(keyCode, label, callback);
+    }
+
     /** Sends text over the persistent IME session that also tracks the focused box field. */
     public static void sendMonitoredText(String text, ResultCallback callback) {
         TextMonitor current = textMonitor;
@@ -487,6 +497,11 @@ public final class AndroidTvRemote {
         current.sendKey(KEYCODE_ENTER, "Enter", callback);
     }
 
+    /** A key-inject message with a field status means a text field is focused, even when empty. */
+    static boolean injectHasFocusedField(RemoteInfo info) {
+        return info != null && info.imeInject && info.hasFieldStatus;
+    }
+
     private static final class TextMonitor implements Runnable {
         private final Context context;
         private final String host;
@@ -496,9 +511,7 @@ public final class AndroidTvRemote {
         private final Object writeLock = new Object();
         private volatile boolean started;
         private volatile boolean imeSupported = true;
-        private volatile int imeCounter;
-        private volatile int fieldCounter;
-        private volatile boolean countersKnown;
+        private final BoxImeState state = new BoxImeState();
         private volatile boolean fieldFocused;
         private boolean lastFocused;
         private String lastLabel = "";
@@ -535,12 +548,12 @@ public final class AndroidTvRemote {
         }
 
         void sendText(String text, ResultCallback callback) {
-            if (!fieldFocused) {
-                postResult(callback, false, "Select a text field on the box first.");
-                return;
-            }
             if (!started || socket == null) {
                 postResult(callback, false, "The box is still connecting. Try again.");
+                return;
+            }
+            if (!fieldFocused || !state.hasField()) {
+                postResult(callback, false, "Select a text field on the box first.");
                 return;
             }
             if (!imeSupported) {
@@ -550,7 +563,7 @@ public final class AndroidTvRemote {
             }
             IO.execute(() -> {
                 long deadline = System.currentTimeMillis() + 450;
-                while (!countersKnown && started && socket != null
+                while (!state.isKnown() && started && socket != null
                         && System.currentTimeMillis() < deadline) {
                     try {
                         Thread.sleep(25);
@@ -559,24 +572,41 @@ public final class AndroidTvRemote {
                         break;
                     }
                 }
-                int ime = imeCounter;
-                int field = fieldCounter;
+                if (!fieldFocused || !state.hasField()) {
+                    postResult(callback, false, "Select a text field on the box first.");
+                    return;
+                }
+                int ime = state.imeCounter();
+                int field = state.fieldCounter();
                 try {
-                    byte[] payload = remoteImeBatchEdit(text, ime, field);
+                    // Send only the new characters. The box inserts the value at its current
+                    // caret; sending the whole field again would duplicate what is already there.
+                    // The local edit still tracks the full value so delete and the next edit
+                    // start from the right place.
+                    BoxImeState.Edit edit = state.editFor(text);
+                    byte[] payload = remoteImeBatchEdit(text, edit.caret, ime, field);
                     StringBuilder hex = new StringBuilder();
-                    for (byte value : payload) {
-                        hex.append(String.format("%02x", value));
+                    for (byte b : payload) {
+                        hex.append(String.format("%02x", b));
                     }
                     Log.d(TAG, "Box IME: payload=" + hex);
                     write(payload);
-                    Log.d(TAG, "Box IME: text sent length=" + text.length()
-                            + " counters=" + ime + "/" + field
-                            + (countersKnown ? "" : " (counters not reported yet)"));
+                    // Keep the local field in sync even if the box does not echo another inject
+                    // message. A later edit must build on this value, not on the old one.
+                    state.applyEdit(edit);
+                    Log.d(TAG, "Box IME: inserted=\"" + text + "\" field=\"" + edit.value
+                            + "\" caret=" + edit.caret + " counters=" + ime + "/" + field
+                            + (state.isKnown() ? "" : " (counters not reported yet)"));
                     postResult(callback, true, null);
                 } catch (Exception e) {
                     postResult(callback, false, friendly(e));
                 }
             });
+        }
+
+        /** True when the session is connected and the box is listening on it. */
+        boolean isReady() {
+            return started && socket != null;
         }
 
         void sendKey(int keyCode, String label, ResultCallback callback) {
@@ -587,6 +617,9 @@ public final class AndroidTvRemote {
             IO.execute(() -> {
                 try {
                     write(remoteKey(keyCode));
+                    if (keyCode == KEYCODE_DEL) {
+                        state.applyDelete();
+                    }
                     Log.d(TAG, "Box IME: " + label + " sent");
                     postResult(callback, true, null);
                 } catch (Exception e) {
@@ -627,10 +660,12 @@ public final class AndroidTvRemote {
             socket = current;
             started = false;
             imeSupported = true;
-            imeCounter = 0;
-            fieldCounter = 0;
-            countersKnown = false;
             fieldFocused = false;
+            // A reconnect is a new remote session: old counters and the old field must not leak
+            // into it. Reset the focus cache too so a focused field is reported to the UI again.
+            state.reset();
+            lastFocused = false;
+            lastLabel = "";
             current.setSoTimeout(2000);
             Log.d(TAG, "Box IME: monitor connected to " + host);
             try {
@@ -665,33 +700,32 @@ public final class AndroidTvRemote {
                         Log.d(TAG, "Box IME: remote started");
                     }
                     if (info.imeBatchEdit) {
-                        imeCounter = info.imeCounter;
-                        fieldCounter = info.fieldCounter;
-                        countersKnown = true;
-                        Log.d(TAG, "Box IME: batch counters="
-                                + imeCounter + "/" + fieldCounter);
+                        // The box echoes the batch edit with placeholder counters. Those are not
+                        // the live ones, so they must never be used for the next edit.
+                        state.onBatch(info);
+                        Log.d(TAG, "Box IME: batch edit echoed");
                     }
                     if (info.imeShow) {
+                        state.onShow(info);
                         fieldFocused = true;
                         report(true, info.fieldLabel);
                     } else if (info.imeInject) {
                         String label = info.fieldLabel;
-                        if (!countersKnown) {
-                            imeCounter = info.imeCounter;
-                            fieldCounter = info.fieldCounter;
-                        }
+                        // The live counters live in the inject message. Echoing the ones from the
+                        // echoed batch edit is what makes the box drop the text without a word.
+                        state.onInject(info);
                         Log.d(TAG, "Box IME: inject app=" + info.imeApp
                                 + " hasField=" + info.hasFieldStatus
                                 + " label=" + label
                                 + " valueLen=" + info.fieldValue.length()
                                 + " selection=" + info.fieldStart + "/" + info.fieldEnd
-                                + " counters=" + imeCounter + "/" + fieldCounter);
-                        if (!info.hasFieldStatus) {
+                                + " counters=" + state.imeCounter() + "/" + state.fieldCounter());
+                        if (!injectHasFocusedField(info)) {
                             fieldFocused = false;
                             report(false, "");
-                        } else if (!info.fieldValue.isEmpty()
-                                || (label != null && !label.isEmpty())
-                                || info.fieldStart > 0 || info.fieldEnd > 0) {
+                        } else {
+                            // An empty status is still a focused field. Search fields often
+                            // have no value, label or selection when the cursor first lands.
                             fieldFocused = true;
                             report(true, label);
                         }
@@ -700,6 +734,7 @@ public final class AndroidTvRemote {
             } finally {
                 started = false;
                 fieldFocused = false;
+                report(false, "");
                 if (socket == current) {
                     socket = null;
                 }
@@ -730,7 +765,8 @@ public final class AndroidTvRemote {
         void run(String host) throws Exception;
     }
 
-    private static void sendKey(Context context, int keyCode, String label,
+    /** Sends one key to the box over a short-lived connection. */
+    public static void sendKey(Context context, int keyCode, String label,
                                 ResultCallback callback) {
         withBoxHost(context,
                 (host) -> sendKeyTo(context, host, keyCode, label), callback);
@@ -851,123 +887,6 @@ public final class AndroidTvRemote {
             } catch (IOException ignored) {
             }
         }
-    }
-
-    private static void sendTextTo(Context context, String host, String text) throws Exception {
-        Identity identity = loadIdentity(context);
-        SSLSocket socket = openSocket(identity, host, API_PORT);
-        socket.setSoTimeout(600);
-        Log.d(TAG, "Box text: connected to " + host + ":" + API_PORT
-                + ", length=" + text.length());
-        try {
-            int features = REQUESTED_FEATURES;
-            boolean configured = false;
-            boolean started = false;
-            boolean sent = false;
-            boolean acknowledged = false;
-            boolean imeSupported = true;
-            int imeCounter = 0;
-            int fieldCounter = 0;
-            int lastFieldLength = -1;
-            String lastApp = "";
-            String lastFieldLabel = "";
-            long configuredAt = 0;
-            long startedAt = 0;
-            long sentAt = 0;
-            long deadline = System.currentTimeMillis() + 6500;
-            while (System.currentTimeMillis() < deadline
-                    && (!sent || System.currentTimeMillis() - sentAt < 700)) {
-                try {
-                    RemoteInfo info = parseRemote(readMessage(socket));
-                    if (info.error) {
-                        throw new IOException("The Android TV box rejected the remote session.");
-                    }
-                    if (info.configure) {
-                        features = info.features & REQUESTED_FEATURES;
-                        if ((features & FEATURE_KEY) == 0) {
-                            features |= FEATURE_KEY;
-                        }
-                        imeSupported = (features & FEATURE_IME) != 0;
-                        send(socket, remoteConfigure(features));
-                        Log.d(TAG, "Box text: configured, features=" + features);
-                        configured = true;
-                        configuredAt = System.currentTimeMillis();
-                    }
-                    if (info.setActive) {
-                        send(socket, remoteSetActive(features));
-                    }
-                    if (info.ping) {
-                        send(socket, remotePingResponse(info.pingValue));
-                    }
-                    if (info.imeInject) {
-                        int previousLength = lastFieldLength;
-                        imeCounter = info.imeCounter;
-                        fieldCounter = info.fieldCounter;
-                        lastFieldLength = info.fieldValue.length();
-                        lastApp = info.imeApp;
-                        lastFieldLabel = info.fieldLabel;
-                        Log.d(TAG, "Box text: IME field app=" + lastApp
-                                + " label=" + lastFieldLabel
-                                + " valueLen=" + lastFieldLength
-                                + " counters=" + imeCounter + "/" + fieldCounter);
-                        if (sent && previousLength >= 0 && lastFieldLength != previousLength) {
-                            acknowledged = true;
-                            Log.d(TAG, "Box text: IME acknowledged, valueLen=" + lastFieldLength);
-                            break;
-                        }
-                    }
-                    if (info.imeBatchEdit) {
-                        imeCounter = info.imeCounter;
-                        fieldCounter = info.fieldCounter;
-                        Log.d(TAG, "Box text: IME batch counters="
-                                + imeCounter + "/" + fieldCounter);
-                    }
-                    if (info.start) {
-                        started = true;
-                        startedAt = System.currentTimeMillis();
-                    }
-                    long now = System.currentTimeMillis();
-                    boolean waitedForIme = now - startedAt >= 420;
-                    if (started && waitedForIme && !sent) {
-                        sendImeText(socket, text, imeCounter, fieldCounter, imeSupported);
-                        sent = true;
-                        sentAt = now;
-                    }
-                } catch (SocketTimeoutException timeout) {
-                    long now = System.currentTimeMillis();
-                    if (started && now - startedAt >= 700 && !sent) {
-                        sendImeText(socket, text, imeCounter, fieldCounter, imeSupported);
-                        sent = true;
-                        sentAt = now;
-                    } else if (!started && configured && now - configuredAt > 1400 && !sent) {
-                        // A few Android TV builds answer configure but never send remote_start.
-                        Log.d(TAG, "Box text: no remote_start, sending after configure");
-                        sendImeText(socket, text, imeCounter, fieldCounter, imeSupported);
-                        sent = true;
-                        sentAt = now;
-                    }
-                }
-            }
-            if (!sent) {
-                throw new IOException("The Android TV box did not become ready for text.");
-            }
-            Log.d(TAG, "Box text: sent, app=" + lastApp + " label=" + lastFieldLabel
-                    + (acknowledged ? ", acknowledged" : ", no IME echo"));
-            Thread.sleep(160);
-        } finally {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-            }
-        }
-    }
-
-    private static void sendImeText(SSLSocket socket, String text, int imeCounter,
-                                    int fieldCounter, boolean imeSupported) throws IOException {
-        if (!imeSupported) {
-            throw new IOException("The Android TV box does not support remote text entry.");
-        }
-        send(socket, remoteImeBatchEdit(text, imeCounter, fieldCounter));
     }
 
     // ------------------------------------------------------------------ TLS and identity
@@ -1164,12 +1083,16 @@ public final class AndroidTvRemote {
         return message.bytes();
     }
 
-    static byte[] remoteImeBatchEdit(String text, int imeCounter, int fieldCounter) {
-        int end = Math.max(0, text.codePointCount(0, text.length()) - 1);
+    /**
+     * Builds the batch edit the box expects. The value is the text to insert and the two offsets
+     * are the caret after it. The counters are the ones the box last reported in its key inject
+     * message.
+     */
+    static byte[] remoteImeBatchEdit(String value, int caret, int imeCounter, int fieldCounter) {
         Writer textField = new Writer();
-        textField.varint(1, end);
-        textField.varint(2, end);
-        textField.string(3, text);
+        textField.varint(1, caret);
+        textField.varint(2, caret);
+        textField.string(3, value);
         Writer edit = new Writer();
         edit.varint(1, 1);
         edit.bytes(2, textField.bytes());
@@ -1180,6 +1103,20 @@ public final class AndroidTvRemote {
         Writer message = new Writer();
         message.bytes(21, batch.bytes());
         return message.bytes();
+    }
+
+    /** Turns a caret offset in code points into an index in the Java string. */
+    static int codePointOffsetToIndex(String text, int codePointOffset) {
+        if (text == null || codePointOffset <= 0) {
+            return 0;
+        }
+        int index = 0;
+        int seen = 0;
+        while (index < text.length() && seen < codePointOffset) {
+            index += Character.charCount(text.codePointAt(index));
+            seen++;
+        }
+        return index;
     }
 
     // ------------------------------------------------------------------ framing and protobuf
@@ -1544,12 +1481,18 @@ public final class AndroidTvRemote {
     }
 
     private static void closeQuietly(SSLSocket socket) {
-        if (socket != null) {
+        if (socket == null) {
+            return;
+        }
+        // Closing a TLS socket sends a close_notify, which is network I/O. Doing that on the
+        // main thread would kill the app with NetworkOnMainThreadException, so the close is
+        // always handed to a background thread.
+        IO.execute(() -> {
             try {
                 socket.close();
             } catch (IOException ignored) {
             }
-        }
+        });
     }
 
     private static void release(WifiManager.MulticastLock lock) {

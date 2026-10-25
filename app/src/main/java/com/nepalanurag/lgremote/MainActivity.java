@@ -10,6 +10,7 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
@@ -18,7 +19,10 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.text.Editable;
+import android.text.InputFilter;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.util.Patterns;
 import android.view.Gravity;
@@ -48,11 +52,18 @@ import java.util.Locale;
 /** The whole phone UI: discovery and pairing, the button remote, trackpad and settings. */
 public final class MainActivity extends Activity implements RemoteService.Listener {
     private static final int REQ_NOTIFICATIONS = 41;
+    /**
+     * A brief settle time for the keyboard, short enough that letters show up almost as they are
+     * typed. Keystrokes that arrive during the pause are batched into one edit.
+     */
+    private static final long AUTO_SEND_DELAY_MS = 180L;
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final Runnable autoSendRunnable = this::autoSendText;
     private final List<View> keyControls = new ArrayList<>();
     private final List<View> commandControls = new ArrayList<>();
     private final List<View> textControls = new ArrayList<>();
+    private final List<View> appsTiles = new ArrayList<>();
 
     private RemoteService service;
     private boolean bound;
@@ -85,16 +96,27 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private TrackpadView trackpad;
     private TextView volumeLabel;
     private TextView muteLabel;
-    private EditText tvTextField;
+    private RemoteEditText tvTextField;
+    private TextView tvKeyboardLabel;
     private TextView tvKeyboardHint;
     private boolean textAutoOpened;
     private boolean boxTextAutoOpened;
+    private boolean changingTvText;
+    private boolean textSendInFlight;
+    /** The prefix of the phone draft that the active screen already has. */
+    private String sentText = "";
+    private int textSession;
     private String foregroundApp = "";
 
     private TvDiscovery discovery;
     private Dialog settingsDialog;
     private Dialog appsDialog;
     private Dialog inputsDialog;
+    private Dialog pairingPinDialog;
+    private EditText pairingPinField;
+    private TextView pairingPinError;
+    private TextView pairingPinAction;
+    private boolean pairingPinSubmitting;
     private LinearLayout appsList;
     private TextView appsStatus;
     private LinearLayout inputsList;
@@ -103,7 +125,6 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private AlertDialog boxProgress;
     private boolean boxHomeBusy;
     private boolean boxSettingsBusy;
-    private boolean boxTextBusy;
 
     private final ServiceConnection connection = new ServiceConnection() {
         @Override
@@ -115,6 +136,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 showRemote();
             }
             renderConnection();
+            maybeOpenTextKeyboard();
         }
 
         @Override
@@ -192,6 +214,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         dismiss(settingsDialog);
         dismiss(appsDialog);
         dismiss(inputsDialog);
+        dismiss(pairingPinDialog);
         dismissBoxProgress();
         cancelBoxPairing();
         if (discovery != null) {
@@ -221,7 +244,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         LinearLayout top = Ui.row(this);
-        TextView brand = Ui.text(this, "LG REMOTE", 10, getColor(R.color.accent),
+        TextView brand = Ui.text(this, "LG", 10, getColor(R.color.accent),
                 Typeface.BOLD);
         brand.setLetterSpacing(0.18f);
         TextView suffix = Ui.text(this, "  REMOTE", 10, getColor(R.color.muted), Typeface.BOLD);
@@ -454,6 +477,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
     private void connectTo(String ip, String name) {
         hideKeyboard();
+        dismiss(pairingPinDialog);
         manuallyDisconnected = false;
         RemoteService.start(this, ip, name);
         headerTitle.setText(name == null || name.isEmpty() ? getString(R.string.device_unknown) : name);
@@ -591,8 +615,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             Space pushDown = new Space(this);
             content.addView(pushDown, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-            content.addView(buildTvKeyboardBar());
         }
+        // Landscape phones have very little vertical room, so the bar scrolls with the
+        // controls instead of being pinned. It still has to exist: the TV and box both
+        // route their on-screen text fields through it.
+        content.addView(buildTvKeyboardBar());
 
         return scroll;
     }
@@ -609,8 +636,8 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         card.setLayoutParams(cardParams);
 
         LinearLayout header = Ui.row(this);
-        TextView label = Ui.label(this, getString(R.string.tv_keyboard_section));
-        header.addView(label);
+        tvKeyboardLabel = Ui.label(this, getString(R.string.tv_keyboard_section));
+        header.addView(tvKeyboardLabel);
         View spacer = new View(this);
         header.addView(spacer, new LinearLayout.LayoutParams(0, dp(1), 1f));
         TextView tvSettings = Ui.text(this, getString(R.string.device_settings), 10.5f,
@@ -634,15 +661,22 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         rowParams.topMargin = dp(8);
         card.addView(row, rowParams);
 
-        tvTextField = new EditText(this);
+        tvTextField = new RemoteEditText(this);
+        tvTextField.setBackspaceListener(this::backspaceEmptyDraft);
         tvTextField.setHint(R.string.tv_keyboard_hint);
         tvTextField.setHintTextColor(getColor(R.color.muted));
         tvTextField.setTextColor(getColor(R.color.text));
         tvTextField.setTextSize(14);
         tvTextField.setSingleLine(true);
+        // Plain text, never a composing/autocorrect word: the phone must not rewrite a character
+        // after it has already been sent to the device.
         tvTextField.setInputType(InputType.TYPE_CLASS_TEXT
-                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
-        tvTextField.setImeOptions(EditorInfo.IME_ACTION_SEND);
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        // Keep the remote visible in landscape: without these, Gboard replaces the whole screen
+        // with its own enlarged text editor as soon as the keyboard opens.
+        tvTextField.setImeOptions(EditorInfo.IME_ACTION_SEND
+                | EditorInfo.IME_FLAG_NO_EXTRACT_UI
+                | EditorInfo.IME_FLAG_NO_FULLSCREEN);
         tvTextField.setPadding(dp(13), 0, dp(13), 0);
         tvTextField.setBackground(Ui.round(this, getColor(R.color.surface_2), 13,
                 getColor(R.color.stroke), 1));
@@ -653,11 +687,27 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             }
             return false;
         });
+        tvTextField.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (!changingTvText) {
+                    scheduleAutoSend();
+                }
+            }
+        });
         row.addView(tvTextField, new LinearLayout.LayoutParams(0, dp(48), 1f));
         textControls.add(tvTextField);
 
         ImageButton delete = iconAction(R.drawable.ic_backspace,
-                getString(R.string.tv_keyboard_delete), false, this::deleteTvText);
+                getString(R.string.tv_keyboard_delete), false, this::deleteDraftOrRemote);
         ImageButton enter = iconAction(R.drawable.ic_enter,
                 getString(R.string.tv_keyboard_enter), false, this::sendTvTextAndEnter);
         ImageButton send = iconAction(R.drawable.ic_send,
@@ -719,8 +769,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 getColor(R.color.danger), this::powerPressed);
         View inputs = actionTile(R.drawable.ic_input, getString(R.string.inputs),
                 getColor(R.color.accent), this::showInputs);
-        View apps = actionTile(R.drawable.ic_apps, getString(R.string.apps),
-                getColor(R.color.accent), this::showApps);
+        View apps = tvAppsTile();
         quick.addView(power, weighted(1f, 68, 0, 8));
         quick.addView(inputs, weighted(1f, 68, 0, 8));
         quick.addView(apps, weighted(1f, 68, 0, 0));
@@ -877,8 +926,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 getColor(R.color.danger), this::powerPressed);
         View inputs = actionTile(R.drawable.ic_input, getString(R.string.inputs),
                 getColor(R.color.accent), this::showInputs);
-        View apps = actionTile(R.drawable.ic_apps, getString(R.string.apps),
-                getColor(R.color.accent), this::showApps);
+        View apps = tvAppsTile();
         quick.addView(power, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         quick.addView(inputs, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         quick.addView(apps, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
@@ -956,9 +1004,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
             @Override
             public void onClick() {
-                if (service != null) {
-                    service.sendClick();
-                }
+                pointerClickPressed();
             }
 
             @Override
@@ -981,8 +1027,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 getColor(R.color.danger), this::powerPressed);
         View inputs = actionTile(R.drawable.ic_input, getString(R.string.inputs),
                 getColor(R.color.accent), this::showInputs);
-        View apps = actionTile(R.drawable.ic_apps, getString(R.string.apps),
-                getColor(R.color.accent), this::showApps);
+        View apps = tvAppsTile();
         quick.addView(power, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         quick.addView(inputs, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         quick.addView(apps, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
@@ -1003,9 +1048,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         });
         click.setOnClickListener(v -> {
             clickHaptic(v);
-            if (service != null) {
-                service.sendClick();
-            }
+            pointerClickPressed();
         });
         home.setOnClickListener(v -> {
             clickHaptic(v);
@@ -1075,9 +1118,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
             @Override
             public void onClick() {
-                if (service != null) {
-                    service.sendClick();
-                }
+                pointerClickPressed();
             }
 
             @Override
@@ -1108,9 +1149,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         });
         click.setOnClickListener(v -> {
             clickHaptic(v);
-            if (service != null) {
-                service.sendClick();
-            }
+            pointerClickPressed();
         });
         home.setOnClickListener(v -> {
             clickHaptic(v);
@@ -1157,6 +1196,34 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         params.bottomMargin = dp(bottomDp);
         return params;
+    }
+
+    /**
+     * The TV app shortcut is deliberately not owned by the active-screen controller: even while
+     * the box input is on screen this tile opens the LG TV's app list, not the box's apps.
+     */
+    private View tvAppsTile() {
+        View tile = actionTile(R.drawable.ic_apps, getString(R.string.apps),
+                getColor(R.color.accent), this::showApps);
+        appsTiles.add(tile);
+        return tile;
+    }
+
+    private void updateTvAppsLabels() {
+        boolean boxActive = service != null && service.isBoxActive();
+        String label = getString(boxActive ? R.string.tv_apps : R.string.apps);
+        for (View tile : appsTiles) {
+            tile.setContentDescription(label);
+            if (tile instanceof LinearLayout) {
+                LinearLayout layout = (LinearLayout) tile;
+                if (layout.getChildCount() > 1) {
+                    View child = layout.getChildAt(1);
+                    if (child instanceof TextView) {
+                        ((TextView) child).setText(label);
+                    }
+                }
+            }
+        }
     }
 
     private View actionTile(int iconRes, String label, int tint, Runnable action) {
@@ -1278,9 +1345,17 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 break;
             case PAIRING:
                 styleDot(getColor(R.color.violet));
-                headerSubtitle.setText(getString(R.string.approve_tv) + (ip == null ? "" : " · " + ip));
                 tintBanner(getColor(R.color.violet));
-                showBanner(getString(R.string.pairing_banner), null, null);
+                if (service.isPairingPinRequired()) {
+                    headerSubtitle.setText(getString(R.string.pairing_pin_header)
+                            + (ip == null ? "" : " · " + ip));
+                    showBanner(getString(R.string.pairing_pin_banner),
+                            getString(R.string.pairing_pin_open), this::showPairingPinDialog);
+                } else {
+                    headerSubtitle.setText(getString(R.string.approve_tv)
+                            + (ip == null ? "" : " · " + ip));
+                    showBanner(getString(R.string.pairing_banner), null, null);
+                }
                 break;
             case RECONNECTING:
                 styleDot(getColor(R.color.amber));
@@ -1411,15 +1486,20 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private void refreshEnabled() {
         boolean connected = service != null && service.isConnected();
         boolean pointer = connected && service.isPointerReady();
+        boolean boxActive = service != null && service.isBoxActive();
+        // The box carries its own keys, so box navigation must not wait for the TV pointer
+        // socket. In TV mode the pointer is still what makes the navigation buttons usable.
+        boolean keysReady = connected && (boxActive || pointer);
         for (View view : keyControls) {
-            view.setEnabled(pointer);
-            view.setAlpha(pointer ? 1f : 0.42f);
+            view.setEnabled(keysReady);
+            view.setAlpha(keysReady ? 1f : 0.42f);
         }
         for (View view : commandControls) {
             view.setEnabled(connected);
             view.setAlpha(connected ? 1f : 0.42f);
         }
         refreshTextBar(connected);
+        updateTvAppsLabels();
     }
 
     private void refreshTextBar(boolean connected) {
@@ -1428,10 +1508,14 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
         boolean boxActive = service != null && service.isBoxActive();
         boolean boxReady = boxActive && AndroidTvRemote.isPaired(this);
-        boolean ready = connected && !boxTextBusy && (!boxActive || boxReady);
+        boolean ready = connected && (!boxActive || boxReady);
         for (View view : textControls) {
             view.setEnabled(ready);
             view.setAlpha(ready ? 1f : 0.42f);
+        }
+        if (tvKeyboardLabel != null) {
+            tvKeyboardLabel.setText(getString(boxActive
+                    ? R.string.tv_keyboard_box_section : R.string.tv_keyboard_section));
         }
         if (tvKeyboardHint != null) {
             if (!connected) {
@@ -1467,8 +1551,24 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
         if (state != LgTvClient.State.READY) {
             textAutoOpened = false;
+            boxTextAutoOpened = false;
+        }
+        if (state != LgTvClient.State.PAIRING) {
+            dismiss(pairingPinDialog);
         }
         renderConnection();
+        if (state == LgTvClient.State.READY) {
+            maybeOpenTextKeyboard();
+        }
+    }
+
+    @Override
+    public void onPairingPin(boolean required, boolean submitting, String error) {
+        if (!required) {
+            dismiss(pairingPinDialog);
+            return;
+        }
+        showPairingPinDialog(submitting, error);
     }
 
     @Override
@@ -1501,10 +1601,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
     @Override
     public void onForegroundApp(String appId) {
-        foregroundApp = appId == null ? "" : appId;
+        String next = appId == null ? "" : appId;
+        if (!next.equals(foregroundApp)) {
+            resetTextSession();
+        }
+        foregroundApp = next;
         if (service != null) {
             renderConnection();
         }
+        maybeOpenTextKeyboard();
     }
 
     @Override
@@ -1519,26 +1624,18 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (tvTextField == null) {
             return;
         }
+        Log.d("LgRemote", "TV text field focused=" + focused + " hidden=" + hidden
+                + " type=" + contentType);
         if (focused && !hidden) {
-            boolean lgReady = service != null && service.isConnected() && !service.isBoxActive();
-            if (lgReady && !textAutoOpened) {
-                textAutoOpened = true;
-                tvTextField.postDelayed(() -> {
-                    if (isFinishing() || isDestroyed() || tvTextField == null) {
-                        return;
-                    }
-                    if (service == null || !service.isTextFieldFocused()
-                            || service.isBoxActive()) {
-                        return;
-                    }
-                    showTvKeyboard();
-                }, 220);
-            }
+            maybeOpenTextKeyboard();
         } else {
             textAutoOpened = false;
-            if (tvTextField.hasFocus() && (service == null || !service.isBoxActive())) {
-                tvTextField.clearFocus();
-                hideKeyboard();
+            if (service == null || !service.isBoxActive()) {
+                resetTextSession();
+                if (tvTextField.hasFocus()) {
+                    tvTextField.clearFocus();
+                    hideKeyboard();
+                }
             }
         }
     }
@@ -1549,29 +1646,77 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
         if (focused) {
-            boolean boxReady = service != null && service.isConnected() && service.isBoxActive();
-            if (boxReady && !boxTextAutoOpened) {
-                boxTextAutoOpened = true;
-                tvTextField.postDelayed(() -> {
-                    if (isFinishing() || isDestroyed() || tvTextField == null) {
-                        return;
-                    }
-                    if (service == null || !service.isBoxActive()
-                            || !service.isBoxTextFieldFocused() || !hasWindowFocus()) {
-                        return;
-                    }
-                    if (remoteView != null && remoteView.getVisibility() != View.VISIBLE) {
-                        return;
-                    }
-                    showTvKeyboard();
-                }, 220);
-            }
+            maybeOpenTextKeyboard();
         } else {
             boxTextAutoOpened = false;
-            if (tvTextField.hasFocus() && service != null && service.isBoxActive()) {
-                tvTextField.clearFocus();
-                hideKeyboard();
+            if (service != null && service.isBoxActive()) {
+                resetTextSession();
+                if (tvTextField.hasFocus()) {
+                    tvTextField.clearFocus();
+                    hideKeyboard();
+                }
             }
+        }
+    }
+
+    /**
+     * Opens the phone keyboard when the active device reports a text field. A focus event can
+     * arrive while the activity is in the background, so this is also retried when the window
+     * comes back to the front instead of permanently consuming the one automatic attempt.
+     */
+    private void maybeOpenTextKeyboard() {
+        if (tvTextField == null || service == null || !service.isConnected()
+                || remoteView == null || remoteView.getVisibility() != View.VISIBLE
+                || !hasWindowFocus()) {
+            return;
+        }
+        final boolean box = service.isBoxActive();
+        if (box) {
+            if (!service.isBoxTextFieldFocused() || boxTextAutoOpened) {
+                return;
+            }
+            boxTextAutoOpened = true;
+        } else {
+            if (!service.isTextFieldFocused() || textAutoOpened) {
+                return;
+            }
+            textAutoOpened = true;
+        }
+        tvTextField.postDelayed(() -> {
+            if (isFinishing() || isDestroyed() || tvTextField == null) {
+                return;
+            }
+            if (!hasWindowFocus() || remoteView == null
+                    || remoteView.getVisibility() != View.VISIBLE
+                    || service == null || !service.isConnected()) {
+                if (box) {
+                    boxTextAutoOpened = false;
+                } else {
+                    textAutoOpened = false;
+                }
+                return;
+            }
+            if (box) {
+                if (!service.isBoxActive() || !service.isBoxTextFieldFocused()) {
+                    boxTextAutoOpened = false;
+                    return;
+                }
+            } else if (service.isBoxActive() || !service.isTextFieldFocused()) {
+                textAutoOpened = false;
+                return;
+            }
+            showTvKeyboard();
+        }, 220);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            maybeOpenTextKeyboard();
+        } else {
+            textAutoOpened = false;
+            boxTextAutoOpened = false;
         }
     }
 
@@ -1580,6 +1725,20 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
         tvTextField.requestFocus();
+        // In landscape the bar sits below the controls inside a ScrollView. Make sure
+        // focusing it from an on-screen text field brings it into view before the IME
+        // resizes the window.
+        Runnable reveal = () -> {
+            if (tvTextField == null) {
+                return;
+            }
+            tvTextField.requestRectangleOnScreen(new Rect(0, 0,
+                    tvTextField.getWidth(), tvTextField.getHeight()), true);
+        };
+        tvTextField.post(reveal);
+        // The IME resize lands after the first scroll request; nudge again so the bar
+        // stays above the keyboard on short landscape screens.
+        tvTextField.postDelayed(reveal, 350);
         InputMethodManager keyboard = (InputMethodManager)
                 getSystemService(INPUT_METHOD_SERVICE);
         if (keyboard != null) {
@@ -1588,6 +1747,22 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     }
 
     // ------------------------------------------------------------------ actions
+
+    /** A trackpad/click tap follows the active screen; the box has no pointer, so it becomes OK. */
+    private void pointerClickPressed() {
+        if (service == null) {
+            return;
+        }
+        if (service.isBoxActive()) {
+            if (!AndroidTvRemote.isPaired(this)) {
+                showBoxSetupPrompt();
+                return;
+            }
+            sendButton("ENTER");
+            return;
+        }
+        service.sendClick();
+    }
 
     private void sendButton(String name) {
         if (service == null) {
@@ -1682,69 +1857,197 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     }
 
     private void sendTvText(boolean enter) {
+        sendTvText(enter, false);
+    }
+
+    /** Sends pending text after a short typing pause, with no Enter press. */
+    private void autoSendText() {
+        if (remoteView == null || remoteView.getVisibility() != View.VISIBLE
+                || !hasWindowFocus()) {
+            return;
+        }
+        sendTvText(false, true);
+    }
+
+    private void scheduleAutoSend() {
+        main.removeCallbacks(autoSendRunnable);
+        if (changingTvText || tvTextField == null) {
+            return;
+        }
+        if (tvTextField.getText().toString().equals(sentText)) {
+            return;
+        }
+        main.postDelayed(autoSendRunnable, AUTO_SEND_DELAY_MS);
+    }
+
+    private void sendTvText(boolean enter, boolean automatic) {
         if (tvTextField == null) {
             return;
         }
-        if (service == null || !service.isConnected()) {
-            toast(R.string.tv_not_ready);
+        if (automatic) {
+            main.removeCallbacks(autoSendRunnable);
+        }
+        if (textSendInFlight) {
+            if (automatic) {
+                scheduleAutoSend();
+            }
             return;
         }
-        String text = tvTextField.getText().toString();
-        if (text.isEmpty() && !enter) {
-            toast(R.string.tv_keyboard_empty);
+        if (service == null || !service.isConnected()) {
+            if (!automatic) {
+                toast(R.string.tv_not_ready);
+            }
             return;
         }
         boolean box = service.isBoxActive();
         if (box && !AndroidTvRemote.isPaired(this)) {
-            showBoxSetupPrompt();
+            if (!automatic) {
+                showBoxSetupPrompt();
+            }
             return;
         }
-        if (box && boxTextBusy) {
-            return;
+        if (automatic) {
+            boolean focused = box ? service.isBoxTextFieldFocused()
+                    : service.isTextFieldFocused();
+            if (!focused) {
+                return;
+            }
         }
         RemoteController remote = service.activeRemote();
-        if (text.isEmpty()) {
-            sendRemoteEnter(remote, box);
+        String current = tvTextField.getText().toString();
+        if (current.isEmpty() && sentText.isEmpty()) {
+            if (enter) {
+                sendRemoteEnter(remote);
+            } else if (!automatic) {
+                toast(R.string.tv_keyboard_empty);
+            }
             return;
         }
-        if (box) {
-            setBoxTextBusy(true);
+        if (current.equals(sentText)) {
+            if (enter) {
+                sendRemoteEnter(remote);
+            }
+            return;
         }
-        remote.sendText(text, (ok, error) -> {
+        textSendInFlight = true;
+        syncTextStep(remote, box, textSession, automatic, enter);
+    }
+
+    /**
+     * Sends only the difference between the draft and what the active screen already has. Keeping
+     * the draft intact while the keyboard is composing avoids clearing a character that the IME
+     * has not committed yet.
+     */
+    private void syncTextStep(RemoteController remote, boolean box, int session,
+                              boolean automatic, boolean enter) {
+        if (session != textSession) {
+            return;
+        }
+        if (tvTextField == null) {
+            textSendInFlight = false;
+            return;
+        }
+        String current = tvTextField.getText().toString();
+        if (current.equals(sentText)) {
+            finishTextSync(remote, box, session, enter);
+            return;
+        }
+        if (TextDiff.deleteCount(current, sentText) > 0) {
+            remote.sendDelete((ok, error) -> {
+                if (session != textSession) {
+                    return;
+                }
+                if (!ok) {
+                    failTextSync(automatic, error);
+                    return;
+                }
+                sentText = TextDiff.dropLastCodePoint(sentText);
+                syncTextStep(remote, box, session, automatic, enter);
+            });
+            return;
+        }
+        String added = TextDiff.appendText(current, sentText);
+        if (added.isEmpty()) {
+            finishTextSync(remote, box, session, enter);
+            return;
+        }
+        remote.sendText(added, (ok, error) -> {
+            if (session != textSession) {
+                return;
+            }
             if (!ok) {
-                if (box) {
-                    setBoxTextBusy(false);
-                }
-                toast(error == null ? getString(R.string.tv_keyboard_failed) : error);
+                failTextSync(automatic, error);
                 return;
             }
-            clearTvText();
-            if (!enter) {
-                if (box) {
-                    setBoxTextBusy(false);
-                }
-                return;
-            }
+            sentText = sentText + added;
+            syncTextStep(remote, box, session, automatic, enter);
+        });
+    }
+
+    private void finishTextSync(RemoteController remote, boolean box, int session, boolean enter) {
+        if (session != textSession) {
+            return;
+        }
+        textSendInFlight = false;
+        if (tvTextField == null) {
+            return;
+        }
+        if (!tvTextField.getText().toString().equals(sentText)) {
+            // More letters arrived while the previous request was in flight.
+            scheduleAutoSend();
+            return;
+        }
+        if (enter) {
             if (box) {
-                main.postDelayed(() -> sendRemoteEnter(remote, true), 260);
+                main.postDelayed(() -> sendRemoteEnter(remote), 260);
             } else {
-                sendRemoteEnter(remote, false);
+                sendRemoteEnter(remote);
+            }
+        }
+        // Keep the draft in the field. This lets the IME keep composing and lets the next
+        // backspace delete locally before it reaches the device, without losing characters.
+    }
+
+    private void failTextSync(boolean automatic, String error) {
+        textSendInFlight = false;
+        if (!automatic) {
+            toast(error == null ? getString(R.string.tv_keyboard_failed) : error);
+        }
+    }
+
+    private void resetTextSession() {
+        textSession++;
+        main.removeCallbacks(autoSendRunnable);
+        textSendInFlight = false;
+        sentText = "";
+        if (tvTextField != null && tvTextField.length() > 0) {
+            replaceTvText("");
+        }
+    }
+
+    private void sendRemoteEnter(RemoteController remote) {
+        remote.sendEnter((ok, error) -> {
+            if (!ok) {
+                toast(error == null ? getString(R.string.tv_keyboard_failed) : error);
             }
         });
     }
 
-    private void sendRemoteEnter(RemoteController remote, boolean box) {
-        if (box) {
-            setBoxTextBusy(true);
+    /** The delete button follows the same rule as the keyboard: draft first, then the device. */
+    private void deleteDraftOrRemote() {
+        if (tvTextField != null && tvTextField.isEnabled() && tvTextField.length() > 0) {
+            int start = tvTextField.getSelectionStart();
+            int end = tvTextField.getSelectionEnd();
+            if (start >= 0 && end >= 0) {
+                if (start != end) {
+                    tvTextField.getText().delete(Math.min(start, end), Math.max(start, end));
+                } else if (start > 0) {
+                    tvTextField.getText().delete(start - 1, start);
+                }
+            }
+            return;
         }
-        remote.sendEnter((ok, error) -> {
-            if (box) {
-                setBoxTextBusy(false);
-            }
-            if (!ok) {
-                toast(error == null ? getString(R.string.tv_keyboard_failed) : error);
-            }
-        });
+        deleteTvText();
     }
 
     private void deleteTvText() {
@@ -1757,31 +2060,35 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             showBoxSetupPrompt();
             return;
         }
-        if (box && boxTextBusy) {
-            return;
-        }
-        if (box) {
-            setBoxTextBusy(true);
-        }
         service.activeRemote().sendDelete((ok, error) -> {
-            if (box) {
-                setBoxTextBusy(false);
-            }
             if (!ok) {
                 toast(error == null ? getString(R.string.tv_keyboard_failed) : error);
             }
         });
     }
 
-    private void clearTvText() {
-        if (tvTextField != null) {
-            tvTextField.setText("");
+    /** Backspace on an empty draft: flush pending deletes or reach past what this session sent. */
+    private void backspaceEmptyDraft() {
+        if (!sentText.isEmpty()) {
+            main.removeCallbacks(autoSendRunnable);
+            sendTvText(false, false);
+            return;
         }
+        deleteTvText();
     }
 
-    private void setBoxTextBusy(boolean busy) {
-        boxTextBusy = busy;
-        refreshEnabled();
+    /** Replaces the field without treating the edit as typing (and re-triggering auto-send). */
+    private void replaceTvText(String text) {
+        if (tvTextField == null) {
+            return;
+        }
+        changingTvText = true;
+        try {
+            tvTextField.setText(text == null ? "" : text);
+            tvTextField.setSelection(tvTextField.length());
+        } finally {
+            changingTvText = false;
+        }
     }
 
     private void showBoxSetupPrompt() {
@@ -1797,6 +2104,10 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (boxPairing != null) {
             boxPairing.close();
             boxPairing = null;
+        }
+        if (service != null) {
+            // The old certificate/session must not stay live while a new pairing code is issued.
+            service.stopBoxSession();
         }
         String saved = SecureStore.getBoxHost(this);
         if (saved != null && !saved.isEmpty()) {
@@ -1996,7 +2307,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 .setMessage(R.string.box_forget_body)
                 .setPositiveButton(R.string.box_forget_confirm, (dialog, which) -> {
                     cancelBoxPairing();
+                    if (service != null) {
+                        service.stopBoxSession();
+                    }
                     AndroidTvRemote.forget(this);
+                    renderConnection();
                     toast(R.string.box_forgotten);
                 })
                 .setNegativeButton(R.string.cancel, null)
@@ -2396,6 +2711,274 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         return row;
     }
 
+    private void showPairingPinDialog() {
+        if (service != null) {
+            showPairingPinDialog(service.isPinSubmitting(), service.getPinError());
+        }
+    }
+
+    private void showPairingPinDialog(boolean submitting, String error) {
+        if (isFinishing() || isDestroyed() || service == null
+                || !service.isPairingPinRequired()) {
+            return;
+        }
+        if (pairingPinDialog != null && pairingPinDialog.isShowing()) {
+            renderPairingPinDialog(submitting, error);
+            if (pairingPinField != null && !submitting) {
+                pairingPinField.requestFocus();
+            }
+            return;
+        }
+
+        Dialog dialog = new Dialog(this);
+        pairingPinDialog = dialog;
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        dialog.setCanceledOnTouchOutside(false);
+        // Back must not silently drop the only way to enter the TV's PIN. The sheet has
+        // an explicit Cancel action, which also ends the pairing session properly.
+        dialog.setCancelable(false);
+
+        LinearLayout panel = Ui.column(this);
+        panel.setPadding(dp(24), dp(22), dp(24), dp(22));
+        panel.setBackground(Ui.round(this, getColor(R.color.surface), 28,
+                getColor(R.color.stroke), 1));
+
+        FrameLayout badge = new FrameLayout(this);
+        badge.setBackground(Ui.round(this, getColor(R.color.accent_dim), 16,
+                getColor(R.color.stroke), 1));
+        badge.addView(Ui.icon(this, R.drawable.ic_pin, getColor(R.color.accent), 24),
+                new FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER));
+        LinearLayout.LayoutParams badgeParams = Ui.dpParams(this, 48, 48);
+        badgeParams.bottomMargin = dp(16);
+        panel.addView(badge, badgeParams);
+
+        TextView title = Ui.text(this, getString(R.string.pairing_pin_title), 24,
+                getColor(R.color.text), Typeface.BOLD);
+        panel.addView(title);
+
+        TextView body = Ui.text(this, getString(R.string.pairing_pin_body), 13,
+                getColor(R.color.muted), Typeface.NORMAL);
+        body.setLineSpacing(dp(2), 1.3f);
+        LinearLayout.LayoutParams bodyParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bodyParams.topMargin = dp(9);
+        panel.addView(body, bodyParams);
+
+        TextView device = Ui.text(this, service.displayName(), 11,
+                getColor(R.color.accent), Typeface.BOLD);
+        device.setPadding(dp(11), dp(5), dp(11), dp(5));
+        device.setBackground(Ui.round(this, getColor(R.color.accent_dim), 99,
+                getColor(R.color.stroke), 1));
+        LinearLayout.LayoutParams deviceParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        deviceParams.topMargin = dp(15);
+        panel.addView(device, deviceParams);
+
+        pairingPinField = new EditText(this);
+        pairingPinField.setHint(R.string.pairing_pin_hint);
+        pairingPinField.setHintTextColor(getColor(R.color.muted));
+        pairingPinField.setGravity(Gravity.CENTER);
+        pairingPinField.setTextColor(getColor(R.color.text));
+        pairingPinField.setTextSize(26);
+        pairingPinField.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        pairingPinField.setLetterSpacing(0.22f);
+        pairingPinField.setSingleLine(true);
+        pairingPinField.setInputType(InputType.TYPE_CLASS_NUMBER);
+        pairingPinField.setFilters(new InputFilter[]{new InputFilter.LengthFilter(8)});
+        pairingPinField.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        pairingPinField.setPadding(dp(14), dp(12), dp(14), dp(12));
+        pairingPinField.setBackground(Ui.round(this, getColor(R.color.surface_2), 18,
+                getColor(R.color.accent), 1.5f));
+        pairingPinField.setSelectAllOnFocus(true);
+        LinearLayout.LayoutParams fieldParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(62));
+        fieldParams.topMargin = dp(18);
+        panel.addView(pairingPinField, fieldParams);
+
+        pairingPinError = Ui.text(this, "", 12, getColor(R.color.danger), Typeface.NORMAL);
+        pairingPinError.setLineSpacing(0f, 1.25f);
+        pairingPinError.setVisibility(View.GONE);
+        LinearLayout.LayoutParams errorParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        errorParams.topMargin = dp(9);
+        panel.addView(pairingPinError, errorParams);
+
+        TextView hint = Ui.text(this, getString(R.string.pairing_pin_hint_help), 11,
+                getColor(R.color.muted), Typeface.NORMAL);
+        hint.setLineSpacing(0f, 1.25f);
+        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hintParams.topMargin = dp(10);
+        panel.addView(hint, hintParams);
+
+        LinearLayout actions = Ui.row(this);
+        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
+        actionsParams.topMargin = dp(22);
+        panel.addView(actions, actionsParams);
+
+        TextView cancel = pill(getString(R.string.cancel), false);
+        cancel.setOnClickListener(v -> {
+            clickHaptic(v);
+            if (service != null) {
+                service.cancelPairing();
+            }
+            dialog.dismiss();
+        });
+        actions.addView(cancel, new LinearLayout.LayoutParams(0, dp(48), 1f));
+
+        pairingPinAction = pill(getString(R.string.pairing_pin_confirm), true);
+        LinearLayout.LayoutParams actionParams = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        actionParams.leftMargin = dp(10);
+        actions.addView(pairingPinAction, actionParams);
+        pairingPinAction.setOnClickListener(v -> {
+            clickHaptic(v);
+            submitPinFromDialog();
+        });
+
+        pairingPinField.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                if (!pairingPinSubmitting && pairingPinAction != null) {
+                    boolean ready = s != null && s.length() >= 4;
+                    pairingPinAction.setEnabled(ready);
+                    pairingPinAction.setAlpha(ready ? 1f : 0.45f);
+                }
+                if (pairingPinError != null && pairingPinError.getVisibility() == View.VISIBLE) {
+                    pairingPinError.setVisibility(View.GONE);
+                }
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+            }
+        });
+        pairingPinField.setOnEditorActionListener((v, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_DONE) {
+                submitPinFromDialog();
+                return true;
+            }
+            return false;
+        });
+
+        dialog.setOnDismissListener(d -> {
+            pairingPinDialog = null;
+            pairingPinField = null;
+            pairingPinError = null;
+            pairingPinAction = null;
+            pairingPinSubmitting = false;
+        });
+
+        // The PIN sheet is tall, and in landscape the IME leaves very little room.
+        // A full-height transparent window plus a scrollable card keeps the field and
+        // buttons reachable on short screens instead of clipping the bottom action.
+        FrameLayout root = new FrameLayout(this);
+        root.setPadding(dp(16), dp(16), dp(16), dp(16));
+        ScrollView scroll = new ScrollView(this);
+        scroll.setClipToPadding(false);
+        scroll.setVerticalScrollBarEnabled(false);
+        scroll.addView(panel, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        FrameLayout.LayoutParams scrollParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        scrollParams.gravity = Gravity.CENTER;
+        root.addView(scroll, scrollParams);
+        dialog.setContentView(root);
+
+        int width = Math.min(dp(452),
+                getResources().getDisplayMetrics().widthPixels - dp(24));
+        dialog.setOnShowListener(d -> {
+            Window window = dialog.getWindow();
+            if (window == null) {
+                return;
+            }
+            window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+            window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            window.setDimAmount(0.68f);
+            window.setLayout(width, ViewGroup.LayoutParams.MATCH_PARENT);
+            window.setGravity(Gravity.CENTER);
+            window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        });
+        dialog.show();
+        renderPairingPinDialog(submitting, error);
+        pairingPinField.postDelayed(this::showPinKeyboard, 180);
+    }
+
+    private void renderPairingPinDialog(boolean submitting, String error) {
+        if (pairingPinDialog == null || !pairingPinDialog.isShowing()) {
+            return;
+        }
+        pairingPinSubmitting = submitting;
+        if (pairingPinField != null) {
+            pairingPinField.setEnabled(!submitting);
+            pairingPinField.setAlpha(submitting ? 0.65f : 1f);
+        }
+        if (pairingPinAction != null) {
+            int length = pairingPinField == null || pairingPinField.getText() == null
+                    ? 0 : pairingPinField.getText().length();
+            boolean ready = !submitting && length >= 4;
+            pairingPinAction.setText(submitting
+                    ? R.string.pairing_pin_checking : R.string.pairing_pin_confirm);
+            pairingPinAction.setEnabled(ready);
+            pairingPinAction.setAlpha(ready ? 1f : 0.45f);
+        }
+        if (pairingPinError != null) {
+            if (error != null && !error.isEmpty()) {
+                // Clear first: the field's TextWatcher hides any visible error, and we
+                // want the new message to stay on screen after the programmatic clear.
+                if (!submitting && pairingPinField != null) {
+                    pairingPinField.setText("");
+                    pairingPinField.requestFocus();
+                }
+                pairingPinError.setText(error);
+                pairingPinError.setVisibility(View.VISIBLE);
+                if (!submitting && pairingPinField != null) {
+                    pairingPinField.postDelayed(this::showPinKeyboard, 120);
+                }
+            } else if (!submitting) {
+                pairingPinError.setVisibility(View.GONE);
+            }
+        }
+    }
+
+    private void showPinKeyboard() {
+        if (pairingPinSubmitting || pairingPinField == null || pairingPinDialog == null
+                || !pairingPinDialog.isShowing() || isFinishing() || isDestroyed()) {
+            return;
+        }
+        pairingPinField.requestFocus();
+        InputMethodManager keyboard = (InputMethodManager)
+                getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (keyboard != null) {
+            keyboard.showSoftInput(pairingPinField, InputMethodManager.SHOW_IMPLICIT);
+        }
+    }
+
+    private void submitPinFromDialog() {
+        if (service == null || pairingPinField == null || pairingPinSubmitting) {
+            return;
+        }
+        String pin = pairingPinField.getText() == null
+                ? "" : pairingPinField.getText().toString().trim();
+        if (!Protocol.isValidPairingPin(pin)) {
+            if (pairingPinError != null) {
+                pairingPinError.setText(R.string.pairing_pin_invalid);
+                pairingPinError.setVisibility(View.VISIBLE);
+            }
+            pairingPinField.requestFocus();
+            return;
+        }
+        hideKeyboard();
+        renderPairingPinDialog(true, null);
+        if (!service.submitPairingPin(pin)) {
+            renderPairingPinDialog(false, service.getPinError());
+        }
+    }
+
     private void showHelp() {
         new AlertDialog.Builder(this)
                 .setTitle(R.string.setup_help_title)
@@ -2412,8 +2995,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         dismiss(appsDialog);
         Dialog dialog = new Dialog(this);
         appsDialog = dialog;
-        LinearLayout panel = sheet(dialog, getString(R.string.open_app_title));
-        appsStatus = Ui.text(this, getString(R.string.loading_apps), 12,
+        boolean boxActive = service.isBoxActive();
+        // This list always belongs to the LG TV. Opening an app from here is the quick way back
+        // to the TV's apps while the Android TV box input is active.
+        LinearLayout panel = sheet(dialog, getString(boxActive
+                ? R.string.open_tv_apps_title : R.string.open_app_title));
+        appsStatus = Ui.text(this, getString(boxActive
+                ? R.string.loading_tv_apps : R.string.loading_apps), 12,
                 getColor(R.color.muted), Typeface.NORMAL);
         appsStatus.setGravity(Gravity.CENTER);
         panel.addView(appsStatus);

@@ -32,7 +32,11 @@ Java only. Package `com.nepalanurag.lgremote`. Minimum Android 8.0 (API 26), tar
 **Automatic keyboard takeover**
 - Select a text field on the TV and the phone keyboard opens by itself
 - Select a text field on the box and the phone keyboard opens by itself
-- Typed text is delivered to whichever device is on screen
+- Typed text is sent to whichever device is on screen after a short pause
+- Only newly typed characters are sent; the draft stays in the field while the keyboard is composing
+- The keyboard's backspace deletes in the phone draft and mirrors the deletion to the active screen; on an empty draft it sends the delete directly
+- Enter is never pressed for you; the Enter button is there for apps that need it
+- A failed send leaves the text in the phone field so it can be retried
 
 ---
 
@@ -65,8 +69,13 @@ TV is sent anywhere.
 On the TV: **Settings → All Settings → General → External Devices → TV On With Mobile**, and turn
 on **Turn on via Wi-Fi**.
 
-Keep the phone and the TV on the same Wi-Fi. The first time you connect, the TV asks you to allow
-the remote — accept it once. The pairing is remembered, and the client key is stored encrypted.
+Keep the phone and the TV on the same Wi-Fi. The first time you connect, the TV shows a one-time
+PIN. Enter it on the phone — no TV remote is needed for the first pairing. The pairing is
+remembered, and the client key is stored encrypted.
+
+Older webOS builds that do not support PIN pairing fall back to the TV's on-screen approval
+prompt. If a saved client key is rejected after a TV reset, the app retries once with PIN pairing
+instead of deleting the old key until the TV issues a new one.
 
 ### 2. The Android TV box
 
@@ -135,13 +144,15 @@ CEC.
 JAVA_HOME=/opt/homebrew/opt/openjdk@17 ./gradlew testDebugUnitTest
 ```
 
-27 unit tests, no device required:
+63 unit tests, no device required:
 
 | Test | What it covers |
 | --- | --- |
-| `ProtocolTest` | SSAP register, request and subscribe messages, pointer format, text payloads |
+| `ProtocolTest` | SSAP register, PIN pairing payloads, request and subscribe messages, pointer format, text payloads |
 | `BoxImeProtocolTest` | Exact bytes for box key events and IME batch edits, and the parsing of the box's focus messages |
 | `RoutingTest` | The TV-vs-box routing rule |
+| `BackspacePolicyTest` | Local draft edits vs. device backspace |
+| `TextDiffTest` | Incremental draft mirroring, including surrogate pairs |
 | `BackoffTest` | Reconnect backoff |
 | `WakeOnLanTest` | MAC normalisation |
 

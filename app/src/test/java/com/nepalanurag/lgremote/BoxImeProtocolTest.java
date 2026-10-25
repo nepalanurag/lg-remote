@@ -42,7 +42,7 @@ public class BoxImeProtocolTest {
 
     @Test
     public void typedTextIsSentAsFieldTwentyOneWithBothCounters() throws IOException {
-        byte[] message = AndroidTvRemote.remoteImeBatchEdit("hi", 7, 11);
+        byte[] message = AndroidTvRemote.remoteImeBatchEdit("hi", 2, 7, 11);
         byte[] batch = field(message, 21);
         assertNotNull("the batch edit must be wrapped in field 21", batch);
         assertEquals(7, varint(batch, 1));   // ime counter
@@ -55,26 +55,123 @@ public class BoxImeProtocolTest {
         byte[] textField = field(edit, 2);
         assertNotNull("the edit must carry the text field", textField);
         assertEquals("hi", string(textField, 3));
-        assertEquals(1, varint(textField, 1)); // selection end
-        assertEquals(1, varint(textField, 2)); // selection end
+        assertEquals(2, varint(textField, 1)); // caret
+        assertEquals(2, varint(textField, 2)); // caret
     }
 
     @Test
-    public void anEmptySelectionEndIsUsedForASingleCharacter() throws IOException {
+    public void theCaretCountsCodePointsNotBytes() throws IOException {
+        // A single emoji is one code point, so the caret sits at 1 and not at 2.
         byte[] textField = field(field(field(
-                AndroidTvRemote.remoteImeBatchEdit("a", 1, 1), 21), 3), 2);
-        assertEquals(0, varint(textField, 1));
-        assertEquals(0, varint(textField, 2));
-    }
-
-    @Test
-    public void theSelectionEndCountsCodePointsNotBytes() throws IOException {
-        // A single emoji is one code point, so the caret sits at 0 and not at 1.
-        byte[] textField = field(field(field(
-                AndroidTvRemote.remoteImeBatchEdit("\uD83D\uDE00", 1, 1), 21), 3), 2);
-        assertEquals(0, varint(textField, 1));
-        assertEquals(0, varint(textField, 2));
+                AndroidTvRemote.remoteImeBatchEdit("\uD83D\uDE00", 1, 1, 1), 21), 3), 2);
+        assertEquals(1, varint(textField, 1));
+        assertEquals(1, varint(textField, 2));
         assertEquals("\uD83D\uDE00", string(textField, 3));
+    }
+
+    // ------------------------------------------------------------------ counters and edits
+
+    @Test
+    public void theLiveCountersComeFromTheKeyInjectMessage() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "Browser", "com.internet.tvbrowser",
+                        fieldStatus(1, "", 0, 0, "Search"))));
+        assertEquals("the ime counter comes from the app info", 0, state.imeCounter());
+        assertEquals("the field counter comes from the field status", 1, state.fieldCounter());
+    }
+
+    @Test
+    public void theEchoedBatchEditCountersAreNotUsed() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "Browser", "com.internet.tvbrowser",
+                        fieldStatus(1, "", 0, 0, "Search"))));
+        // The box echoes the batch edit with placeholder counters. Echoing those back is what
+        // makes the box drop the text without a word.
+        state.onBatch(AndroidTvRemote.parseRemote(imeBatchEdit(1, 1)));
+        assertEquals(0, state.imeCounter());
+        assertEquals(1, state.fieldCounter());
+    }
+
+    @Test
+    public void typingIntoAnEmptyFieldSendsTheWholeValue() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "Browser", "com.internet.tvbrowser",
+                        fieldStatus(1, "", 0, 0, "Search"))));
+        BoxImeState.Edit edit = state.editFor("hello box");
+        assertEquals("hello box", edit.value);
+        assertEquals(9, edit.caret);
+    }
+
+    @Test
+    public void typingIntoAFilledFieldKeepsWhatWasThere() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "Browser", "com.internet.tvbrowser",
+                        fieldStatus(1, "abc", 3, 3, "Search"))));
+        BoxImeState.Edit edit = state.editFor("hi");
+        assertEquals("abchi", edit.value);
+        assertEquals(5, edit.caret);
+    }
+
+    @Test
+    public void losingTheFieldClearsTheLastValue() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "Browser", "com.internet.tvbrowser",
+                        fieldStatus(1, "abc", 3, 3, "Search"))));
+        assertTrue(state.hasField());
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "Launcher", "com.nepalanurag.tvhome", null)));
+        assertFalse("an inject without a field status means the field is gone", state.hasField());
+    }
+
+    @Test
+    public void aSentEditBecomesTheBaseForTheNextEdit() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "Browser", "com.internet.tvbrowser",
+                        fieldStatus(1, "", 0, 0, "Search"))));
+        state.applyEdit(state.editFor("hi"));
+        BoxImeState.Edit next = state.editFor("!");
+        assertEquals("hi!", next.value);
+        assertEquals(3, next.caret);
+    }
+
+    @Test
+    public void aSentDeleteIsAppliedToTheLocalField() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(0, "YouTube", "com.google.android.youtube.tv",
+                        fieldStatus(1, "ab\uD83D\uDE00", 3, 3, "Search"))));
+        state.applyDelete();
+        BoxImeState.Edit next = state.editFor("!");
+        assertEquals("ab!", next.value);
+        assertEquals(3, next.caret);
+    }
+
+    @Test
+    public void resettingTheSessionForgetsTheOldFieldAndCounters() throws IOException {
+        BoxImeState state = new BoxImeState();
+        state.onInject(AndroidTvRemote.parseRemote(
+                imeInject(7, "Browser", "com.internet.tvbrowser",
+                        fieldStatus(4, "abc", 3, 3, "Search"))));
+        state.reset();
+        assertFalse(state.isKnown());
+        assertFalse(state.hasField());
+        assertEquals(0, state.imeCounter());
+        assertEquals(0, state.fieldCounter());
+    }
+
+    @Test
+    public void aCaretOffsetCountsCodePoints() {
+        assertEquals(0, AndroidTvRemote.codePointOffsetToIndex("", 0));
+        assertEquals(1, AndroidTvRemote.codePointOffsetToIndex("a", 1));
+        // One emoji is one code point but two bytes in a Java string.
+        assertEquals(2, AndroidTvRemote.codePointOffsetToIndex("\uD83D\uDE00", 1));
+        assertEquals(0, AndroidTvRemote.codePointOffsetToIndex("\uD83D\uDE00", 0));
     }
 
     // ------------------------------------------------------------------ incoming bytes
@@ -112,6 +209,24 @@ public class BoxImeProtocolTest {
         assertEquals(0, info.fieldStart);
         assertEquals(4, info.fieldEnd);
         assertEquals(5, info.fieldCounter);
+        assertTrue(AndroidTvRemote.injectHasFocusedField(info));
+    }
+
+    @Test
+    public void anEmptyFieldStatusStillMeansTheFieldIsFocused() throws IOException {
+        // Empty search fields have no value, label or selection when the cursor first lands.
+        RemoteInfo info = AndroidTvRemote.parseRemote(imeInject(0, "YouTube",
+                "com.google.android.youtube.tv", fieldStatus(91, "", 0, 0, "")));
+        assertTrue(info.hasFieldStatus);
+        assertTrue(AndroidTvRemote.injectHasFocusedField(info));
+    }
+
+    @Test
+    public void anInjectWithoutStatusMeansNoFieldIsFocused() throws IOException {
+        RemoteInfo info = AndroidTvRemote.parseRemote(imeInject(9, "YouTube",
+                "com.google.android.youtube.tv", null));
+        assertFalse(info.hasFieldStatus);
+        assertFalse(AndroidTvRemote.injectHasFocusedField(info));
     }
 
     @Test

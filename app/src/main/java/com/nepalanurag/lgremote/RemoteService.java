@@ -35,6 +35,9 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
     public interface Listener {
         void onConnection(LgTvClient.State state, String detail, String name, String model);
 
+        /** PIN pairing state for the first-connect sheet. */
+        void onPairingPin(boolean required, boolean submitting, String error);
+
         void onPointer(boolean ready);
 
         void onVolume(int volume, boolean muted);
@@ -69,6 +72,9 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
     private String tvModel = "";
     private LgTvClient.State state = LgTvClient.State.IDLE;
     private String detail = "";
+    private boolean pinPairing;
+    private boolean pinSubmitting;
+    private String pinError;
     private boolean pointerReady;
     private int volume = -1;
     private boolean muted;
@@ -158,6 +164,7 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         textFieldFocused = false;
         textContentType = "text";
         textHidden = false;
+        setPinPairing(false, false, null);
         SecureStore.setSavedTv(this, ip, tvName);
         ensureForeground();
         updateNotification();
@@ -220,6 +227,7 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
             listeners.add(listener);
         }
         listener.onConnection(state, detail, displayName(), tvModel);
+        listener.onPairingPin(pinPairing, pinSubmitting, pinError);
         listener.onPointer(pointerReady);
         listener.onVolume(volume, muted);
         listener.onApps(apps);
@@ -236,6 +244,28 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
 
     public String getIp() {
         return ip;
+    }
+
+    public boolean isPairingPinRequired() {
+        return pinPairing;
+    }
+
+    public boolean isPinSubmitting() {
+        return pinSubmitting;
+    }
+
+    public String getPinError() {
+        return pinError;
+    }
+
+    public boolean submitPairingPin(String pin) {
+        return client != null && client.submitPairingPin(pin);
+    }
+
+    public void cancelPairing() {
+        if (client != null) {
+            client.cancelPairing();
+        }
     }
 
     public String displayName() {
@@ -391,6 +421,13 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
 
     public boolean isBoxPaired() {
         return AndroidTvRemote.isPaired(this);
+    }
+
+    /** Drops the live box session before re-pairing or forgetting the box identity. */
+    public void stopBoxSession() {
+        if (boxController != null) {
+            boxController.setActive(false);
+        }
     }
 
     LgTvClient getLgClient() {
@@ -557,6 +594,9 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         boolean lostPowerState = newState != LgTvClient.State.READY && tvPowerKnown;
         state = newState;
         detail = newDetail;
+        if (newState != LgTvClient.State.PAIRING) {
+            setPinPairing(false, false, null);
+        }
         if (newState != LgTvClient.State.READY) {
             // Keep the last state for the power button, but do not present it as live.
             tvPowerKnown = false;
@@ -573,6 +613,29 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
             }
         }
         updateActiveControllers();
+    }
+
+    @Override
+    public void onPairingPin(boolean required, boolean submitting, String error) {
+        setPinPairing(required, submitting, error);
+    }
+
+    private void setPinPairing(boolean required, boolean submitting, String error) {
+        if (!required) {
+            submitting = false;
+            error = null;
+        }
+        if (pinPairing == required && pinSubmitting == submitting
+                && (pinError == null ? error == null : pinError.equals(error))) {
+            return;
+        }
+        pinPairing = required;
+        pinSubmitting = submitting;
+        pinError = error;
+        updateNotification();
+        for (Listener listener : listeners) {
+            listener.onPairingPin(required, submitting, error);
+        }
     }
 
     @Override
@@ -728,8 +791,11 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
                 text = getString(R.string.notification_ready, ip == null ? "" : ip);
                 break;
             case PAIRING:
-                title = getString(R.string.notification_pairing);
-                text = getString(R.string.notification_connecting_detail);
+                title = getString(pinPairing
+                        ? R.string.notification_pairing_pin : R.string.notification_pairing);
+                text = pinPairing
+                        ? getString(R.string.notification_pairing_pin_detail)
+                        : getString(R.string.notification_connecting_detail);
                 break;
             case RECONNECTING:
                 title = getString(R.string.notification_reconnecting, name);

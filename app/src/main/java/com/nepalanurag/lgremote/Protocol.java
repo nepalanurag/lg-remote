@@ -12,6 +12,7 @@ public final class Protocol {
 
     public static final String POINTER_SOCKET =
             "ssap://com.webos.service.networkinput/getPointerInputSocket";
+    public static final String SET_PAIRING_PIN = "ssap://pairing/setPin";
 
     /** Button names accepted by the webOS pointer socket. */
     public static final Set<String> BUTTONS = new HashSet<>(Arrays.asList(
@@ -26,9 +27,21 @@ public final class Protocol {
 
     /** The register payload: lgtv2's pairing manifest plus the saved client key, when present. */
     public static String registerPayload(String pairingJson, String clientKey, String id) {
+        return registerPayload(pairingJson, clientKey, null, id);
+    }
+
+    /**
+     * The register payload with an optional pairing mode. PIN makes the TV show a code on
+     * screen that the user enters on the phone, so no TV remote is needed for the first pair.
+     */
+    public static String registerPayload(String pairingJson, String clientKey,
+                                         String pairingType, String id) {
         JsonObject payload = JsonParser.parseString(pairingJson).getAsJsonObject();
         if (clientKey != null && !clientKey.isEmpty()) {
             payload.addProperty("client-key", clientKey);
+        }
+        if (pairingType != null && !pairingType.isEmpty()) {
+            payload.addProperty("pairingType", pairingType);
         }
         JsonObject out = new JsonObject();
         out.addProperty("type", "register");
@@ -37,6 +50,18 @@ public final class Protocol {
         }
         out.add("payload", payload);
         return out.toString();
+    }
+
+    /** A PIN is numeric and LG has used both 6- and 8-digit codes on webOS. */
+    public static boolean isValidPairingPin(String pin) {
+        return pin != null && pin.trim().matches("\\d{4,8}");
+    }
+
+    /** Sends the code shown on the TV back to webOS to finish the pairing handshake. */
+    public static String setPairingPin(String id, String pin) {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("pin", pin == null ? "" : pin.trim());
+        return request(id, SET_PAIRING_PIN, payload);
     }
 
     public static String request(String id, String uri, JsonObject payload) {

@@ -15,7 +15,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -32,12 +34,15 @@ import okhttp3.WebSocket;
 import okhttp3.WebSocketListener;
 
 /**
- * LG webOS SSAP client. Pairing is register-with-manifest, exactly as lgtv2 does; buttons are
- * sent over the separate pointer socket (type:button / type:move / type:click / type:scroll).
+ * LG webOS SSAP client. Pairing is register-with-manifest. New pairings use webOS's PIN mode so
+ * the phone can finish setup without a TV remote; the on-screen prompt remains the fallback for
+ * older firmware. Buttons are sent over the separate pointer socket.
  */
 public final class LgTvClient {
     private static final String TAG = "LgRemote";
     private static final long REQUEST_TIMEOUT_MS = 15_000;
+    private static final long PIN_PAIRING_TIMEOUT_MS = 5 * 60_000L;
+    private static final String PAIRING_PIN = "PIN";
 
     public enum State { IDLE, CONNECTING, PAIRING, READY, RECONNECTING, ERROR }
 
@@ -93,6 +98,12 @@ public final class LgTvClient {
         void onMac(String mac);
 
         void onPointer(boolean ready);
+
+        /**
+         * PIN pairing is active when required is true. submitting is true while the code is
+         * being checked; error is a short, user-facing message when the last code failed.
+         */
+        void onPairingPin(boolean required, boolean submitting, String error);
     }
 
     private interface Callback {
@@ -140,6 +151,11 @@ public final class LgTvClient {
     private int candidate;
     private State state = State.IDLE;
     private String stateDetail = "";
+    private boolean pinPairing;
+    private boolean pinSubmitting;
+    private boolean pinRetry;
+    private String pinError;
+    private boolean keyRejectedRetry;
 
     private Runnable handshakeTimeout;
     private Runnable reconnectRunnable;
@@ -205,8 +221,76 @@ public final class LgTvClient {
         return pointerReady;
     }
 
+    public boolean isPinPairingRequired() {
+        return pinPairing;
+    }
+
+    public boolean isPinSubmitting() {
+        return pinSubmitting;
+    }
+
+    public String getPinError() {
+        return pinError;
+    }
+
     public String getIp() {
         return ip;
+    }
+
+    /** Sends the code displayed on the TV; the TV answers with registered or an error. */
+    public boolean submitPairingPin(String pin) {
+        if (!pinPairing || registered || socket == null) {
+            setPinState(pinPairing, false, "Pairing is not ready. Tap Retry.");
+            return false;
+        }
+        String value = pin == null ? "" : pin.trim();
+        if (!Protocol.isValidPairingPin(value)) {
+            setPinState(true, false, "Enter the 4–8 digit PIN shown on the TV.");
+            return false;
+        }
+        final int gen = generation;
+        pinSubmitting = true;
+        setPinState(true, true, null);
+        postState(State.PAIRING, "Checking PIN…");
+        // Replace the five-minute entry window with a short final-registration window,
+        // so a PIN submitted at the last second cannot race the entry timeout.
+        scheduleHandshakeTimeout(gen, 30_000);
+        JsonObject payload = new JsonObject();
+        payload.addProperty("pin", value);
+        // setPin must be sent before registration is complete, so it cannot use the
+        // normal request() guard that requires a registered session.
+        requestDuringPairing(Protocol.SET_PAIRING_PIN, payload, new Callback() {
+            @Override
+            public void onSuccess(JsonObject response) {
+                if (gen != generation || registered || socket == null) {
+                    return;
+                }
+                pinSubmitting = false;
+                setPinState(true, false, null);
+                postState(State.PAIRING, "PIN accepted. Finishing pairing…");
+            }
+
+            @Override
+            public void onError(String message) {
+                if (gen != generation || registered || socket == null) {
+                    return;
+                }
+                pinSubmitting = false;
+                String lower = message == null ? "" : message.toLowerCase(Locale.US);
+                if (lower.contains("invalid pin") || lower.contains("rejected pairing")
+                        || lower.contains("application error")
+                        || lower.contains("access denied")) {
+                    // webOS ends the pairing session after a bad PIN, so request a
+                    // fresh code instead of leaving the user with a dead dialog.
+                    restartPinPairing(gen,
+                            "That PIN didn't match. Requesting a new PIN…");
+                } else {
+                    setPinState(true, false, friendlyPinError(message));
+                    postState(State.PAIRING, "The PIN wasn't accepted. Try again.");
+                }
+            }
+        }, false);
+        return true;
     }
 
     public void connect(String ip, String clientKey) {
@@ -216,7 +300,12 @@ public final class LgTvClient {
         this.attempt = 0;
         this.candidate = 0;
         this.secure = null;
+        this.keyRejectedRetry = false;
+        this.pinRetry = false;
+        this.pinSubmitting = false;
+        setPinState(false, false, null);
         cancelTimers();
+        clearPending();
         closeSocket();
         closePointer();
         startAttempt();
@@ -227,7 +316,12 @@ public final class LgTvClient {
             return;
         }
         userStopped = false;
+        keyRejectedRetry = false;
+        pinRetry = false;
+        pinSubmitting = false;
+        setPinState(false, false, null);
         cancelTimers();
+        clearPending();
         closeSocket();
         closePointer();
         attempt = 0;
@@ -246,7 +340,30 @@ public final class LgTvClient {
         closeSocket();
         registered = false;
         pointerReady = false;
+        pinRetry = false;
+        pinSubmitting = false;
+        setPinState(false, false, null);
         postState(State.IDLE, "Disconnected");
+    }
+
+    /**
+     * Stops waiting for a PIN. The user can reconnect from the banner or setup screen later.
+     * This does not set userStopped, so an explicit Retry still works.
+     */
+    public void cancelPairing() {
+        if (registered) {
+            return;
+        }
+        generation++;
+        cancelTimers();
+        failPending("Pairing cancelled");
+        closePointer();
+        closeSocket();
+        registered = false;
+        pointerReady = false;
+        listener.onPointer(false);
+        setPinState(false, false, null);
+        postState(State.ERROR, "Pairing cancelled.");
     }
 
     private void startAttempt() {
@@ -259,7 +376,10 @@ public final class LgTvClient {
         pointerReady = false;
 
         String url = buildUrl();
-        if (attempt == 0 && candidate == 0) {
+        if (pinPairing) {
+            postState(State.PAIRING, pinRetry
+                    ? "Requesting a new pairing PIN…" : "Reconnecting for pairing…");
+        } else if (attempt == 0 && candidate == 0) {
             postState(State.CONNECTING, "Connecting to " + ip + "…");
         } else {
             postState(State.RECONNECTING, "Reconnecting to " + ip + "…");
@@ -310,12 +430,15 @@ public final class LgTvClient {
         opened = true;
         Log.d(TAG, "websocket open");
         sendRegister(gen);
-        scheduleHandshakeTimeout(gen, clientKey == null ? 90_000 : 18_000);
+        // Time to get the initial pairing answer. Once the TV puts a PIN on screen,
+        // beginPinPairing extends this to the full five-minute entry window.
+        scheduleHandshakeTimeout(gen, 20_000);
     }
 
     private void sendRegister(int gen) {
         String id = "register_" + sequence.incrementAndGet();
         registerId = id;
+        boolean freshPairing = clientKey == null || clientKey.isEmpty();
         Pending p = new Pending(new Callback() {
             @Override
             public void onSuccess(JsonObject payload) {
@@ -324,8 +447,9 @@ public final class LgTvClient {
             @Override
             public void onError(String message) {
                 if (!registered) {
-                    Log.d(TAG, "register failed");
-                    postState(State.ERROR, "Pairing was not approved on the TV. Tap Retry.");
+                    Log.d(TAG, "register failed: " + message);
+                    setPinState(false, false, null);
+                    postState(State.ERROR, friendlyPairingError(message));
                     cancelTimers();
                     closeSocket();
                 }
@@ -333,9 +457,17 @@ public final class LgTvClient {
         }, false);
         pending.put(id, p);
         if (socket != null) {
-            socket.send(Protocol.registerPayload(pairingJson, clientKey, id));
-            postState(clientKey == null ? State.PAIRING : State.CONNECTING,
-                    clientKey == null ? "Approve the request on your TV" : "Signing in…");
+            // New pairings use PIN so the TV only has to display a code. Saved keys still
+            // register normally through the manifest's PROMPT mode.
+            socket.send(Protocol.registerPayload(pairingJson, clientKey,
+                    freshPairing ? PAIRING_PIN : null, id));
+            if (pinPairing) {
+                // Keep the PIN sheet open while a new code is being requested.
+                postState(State.PAIRING, "Requesting a new pairing PIN…");
+            } else {
+                postState(State.CONNECTING,
+                        freshPairing ? "Requesting a pairing PIN…" : "Signing in…");
+            }
         }
     }
 
@@ -344,8 +476,12 @@ public final class LgTvClient {
         handshakeTimeout = () -> {
             if (gen == generation && !registered) {
                 Log.d(TAG, "handshake timeout");
-                if (clientKey == null && opened) {
-                    postState(State.ERROR, "No answer from the TV. Accept the request on the TV, then retry.");
+                if ((clientKey == null || clientKey.isEmpty()) && opened) {
+                    boolean wasPin = pinPairing;
+                    setPinState(false, false, null);
+                    postState(State.ERROR, wasPin
+                            ? "The PIN request timed out. Tap Retry for a new PIN."
+                            : "The TV didn't answer with a PIN. Tap Retry.");
                     closeSocket();
                 } else {
                     dropAndReconnect(gen, socket, "handshake timeout");
@@ -382,21 +518,64 @@ public final class LgTvClient {
             return;
         }
         if ("hello".equals(type)) {
-            if (!registered) {
-                sendRegister(gen);
-            }
+            // Registration is already sent from onOpen. Re-registering here would replace
+            // registerId and could lose the PIN response during a fresh pairing.
             return;
         }
         if ("error".equals(type)) {
+            String error = str(payload, "errorText");
+            if (error == null || error.isEmpty()) {
+                error = str(message, "error");
+            }
+            // A rejected PIN ends the original register request and the PIN request. The
+            // register error carries no useful detail, so let the PIN request report the
+            // real "Invalid pin code" message and do not tear down the session here.
+            boolean pinRegisterError = !registered && pinPairing && id != null
+                    && id.equals(registerId) && (pinSubmitting || pinError != null || pinRetry);
             Pending p = id == null ? null : pending.remove(id);
-            if (p != null) {
-                p.callback.onError(str(message, "error"));
+            if (pinRegisterError) {
+                Log.d(TAG, "register ended during PIN pairing: " + error);
+            } else if (p != null) {
+                p.callback.onError(error == null ? "The TV rejected the request" : error);
             } else if (!registered) {
-                postState(State.ERROR, "Pairing was not approved on the TV. Tap Retry.");
+                setPinState(false, false, null);
+                postState(State.ERROR, friendlyPairingError(error));
             }
             return;
         }
         if ("response".equals(type) || "subscribe".equals(type)) {
+            // A fresh register with pairingType PIN is answered with a response that only
+            // advertises the mode. The PIN prompt is then shown on the TV; registration is
+            // completed later by ssap://pairing/setPin + a "registered" message.
+            if (!registered && id != null && id.equals(registerId)
+                    && payload.has("pairingType")) {
+                String mode = str(payload, "pairingType");
+                boolean accepted = !payload.has("returnValue")
+                        || !payload.get("returnValue").isJsonPrimitive()
+                        || payload.get("returnValue").getAsBoolean();
+                Pending register = pending.remove(id);
+                if (register != null && register.timeout != null) {
+                    main.removeCallbacks(register.timeout);
+                }
+                if (!accepted) {
+                    String error = str(payload, "errorText");
+                    if (error == null) {
+                        error = str(payload, "errorCode");
+                    }
+                    setPinState(false, false, null);
+                    postState(State.ERROR, friendlyPairingError(error));
+                    closeSocket();
+                    return;
+                }
+                if (clientKey != null && !clientKey.isEmpty() && !keyRejectedRetry) {
+                    retryWithoutSavedKey(gen, mode);
+                } else if (PAIRING_PIN.equalsIgnoreCase(mode)) {
+                    beginPinPairing(gen);
+                } else {
+                    beginPromptPairing(gen);
+                }
+                return;
+            }
             Pending p = id == null ? null : pending.get(id);
             if (p == null) {
                 return;
@@ -420,10 +599,98 @@ public final class LgTvClient {
         }
     }
 
+    private void beginPinPairing(int gen) {
+        if (gen != generation || registered) {
+            return;
+        }
+        boolean retry = pinRetry;
+        pinRetry = false;
+        setPinState(true, false, null);
+        postState(State.PAIRING, retry
+                ? "Enter the new PIN shown on your TV"
+                : "Enter the PIN shown on your TV");
+        // PIN entry can take longer than an on-screen prompt; keep the socket alive.
+        scheduleHandshakeTimeout(gen, PIN_PAIRING_TIMEOUT_MS);
+    }
+
+    private void beginPromptPairing(int gen) {
+        if (gen != generation || registered) {
+            return;
+        }
+        pinRetry = false;
+        setPinState(false, false, null);
+        postState(State.PAIRING, "Approve the request on your TV");
+        scheduleHandshakeTimeout(gen, 90_000);
+    }
+
+    /**
+     * A TV may retain a client key across a factory reset policy change while rejecting it
+     * later. Drop the stale in-memory key once and reconnect in PIN mode, without deleting the
+     * stored key until the TV gives us a new one.
+     */
+    private void retryWithoutSavedKey(int gen, String mode) {
+        if (gen != generation || registered) {
+            return;
+        }
+        if (keyRejectedRetry) {
+            if (PAIRING_PIN.equalsIgnoreCase(mode)) {
+                beginPinPairing(gen);
+            } else {
+                beginPromptPairing(gen);
+            }
+            return;
+        }
+        keyRejectedRetry = true;
+        clientKey = null;
+        pinRetry = false;
+        setPinState(false, false, null);
+        // CONNECTING avoids showing the old "approve on TV" fallback while the fresh
+        // PIN request is in flight; the PIN sheet appears when the TV answers.
+        postState(State.CONNECTING, "Saved pairing expired. Requesting a new PIN…");
+        Log.d(TAG, "saved client key was not accepted; retrying with PIN pairing");
+        restartSocket(1_200);
+    }
+
+    /** webOS invalidates the pairing session after a wrong PIN; reconnect for a fresh code. */
+    private void restartPinPairing(int gen, String error) {
+        if (gen != generation || registered) {
+            return;
+        }
+        pinRetry = true;
+        pinSubmitting = false;
+        setPinState(true, false, error);
+        postState(State.PAIRING, "Requesting a new PIN…");
+        restartSocket(1_200);
+    }
+
+    private void restartSocket(long delayMs) {
+        final int restartGen = ++generation;
+        cancelTimers();
+        clearPending();
+        closePointer();
+        closeSocket();
+        registered = false;
+        pointerReady = false;
+        listener.onPointer(false);
+        main.postDelayed(() -> {
+            // Cancel, retry, or a fresh connect bumps the generation, which makes this
+            // delayed restart stale. Otherwise a quick Cancel could reopen the PIN sheet.
+            if (restartGen == generation && !userStopped && !registered) {
+                attempt = 0;
+                candidate = 0;
+                secure = null;
+                startAttempt();
+            }
+        }, delayMs);
+    }
+
     private void onRegistered(JsonObject payload) {
         registered = true;
         pointerReady = false;
         attempt = 0;
+        pinRetry = false;
+        keyRejectedRetry = false;
+        setPinState(false, false, null);
         cancelHandshakeTimeout();
         if (registerId != null) {
             Pending p = pending.remove(registerId);
@@ -920,7 +1187,8 @@ public final class LgTvClient {
                             continue;
                         }
                         if (appId == null || appId.isEmpty()) {
-                            appId = "com.webos.app." + id.toLowerCase().replace("_", "");
+                            appId = "com.webos.app."
+                                    + id.toLowerCase(Locale.ROOT).replace("_", "");
                         }
                         boolean connected = false;
                         if (device.has("connected") && !device.get("connected").isJsonNull()) {
@@ -1011,7 +1279,30 @@ public final class LgTvClient {
     }
 
     private void request(String uri, JsonObject payload, Callback callback, boolean persistent) {
-        if (!registered || socket == null) {
+        request(uri, payload, callback, persistent, false);
+    }
+
+    /**
+     * webOS pairing commands (notably setPin) are sent while the socket is open but before
+     * the registered message arrives, so they bypass the normal registered-session guard.
+     */
+    private void requestDuringPairing(String uri, JsonObject payload, Callback callback,
+                                      boolean persistent) {
+        request(uri, payload, callback, persistent, true);
+    }
+
+    /**
+     * Pairing commands run on an open socket before the registered message, so they pass
+     * allowUnregistered. Everything else needs a fully registered TV session.
+     */
+    static boolean canSendRequest(boolean registered, boolean socketPresent,
+                                  boolean allowUnregistered) {
+        return socketPresent && (registered || allowUnregistered);
+    }
+
+    private void request(String uri, JsonObject payload, Callback callback, boolean persistent,
+                         boolean allowUnregistered) {
+        if (!canSendRequest(registered, socket != null, allowUnregistered)) {
             callback.onError("Not connected");
             return;
         }
@@ -1027,7 +1318,22 @@ public final class LgTvClient {
             };
             main.postDelayed(p.timeout, REQUEST_TIMEOUT_MS);
         }
-        socket.send(Protocol.request(id, uri, payload));
+        boolean sent;
+        try {
+            sent = socket.send(Protocol.request(id, uri, payload));
+        } catch (Exception e) {
+            sent = false;
+        }
+        if (!sent) {
+            // Do not wait for the timeout when the socket has already gone away.
+            Pending current = pending.remove(id);
+            if (current != null) {
+                if (current.timeout != null) {
+                    main.removeCallbacks(current.timeout);
+                }
+                current.callback.onError("Not connected");
+            }
+        }
     }
 
     private static Callback noop() {
@@ -1059,13 +1365,16 @@ public final class LgTvClient {
         }
         boolean wasRegistered = registered;
         boolean wasOpened = opened;
-        boolean firstPairing = clientKey == null;
+        boolean wasPin = pinPairing;
+        boolean firstPairing = clientKey == null || clientKey.isEmpty();
         socket = null;
         registered = false;
         pointerReady = false;
-        cancelHandshakeTimeout();
+        pinSubmitting = false;
+        cancelTimers();
         closePointer();
         failPending("Connection lost");
+        setPinState(false, false, null);
         listener.onPointer(false);
         if (userStopped) {
             return;
@@ -1073,14 +1382,16 @@ public final class LgTvClient {
         Log.d(TAG, "connection dropped: " + reason);
 
         if (!wasRegistered && firstPairing && wasOpened) {
-            // The TV declined the prompt (or the user closed it). Do not loop prompts.
-            postState(State.ERROR, "Pairing was not approved on the TV. Tap Retry.");
+            // The TV declined the request (or the PIN session ended). Do not loop prompts.
+            postState(State.ERROR, wasPin
+                    ? "Pairing was interrupted. Tap Retry for a new PIN."
+                    : "Pairing was not approved on the TV. Tap Retry.");
             return;
         }
         if (!wasOpened && secure == null && candidate == 0) {
             candidate = 1;
             main.postDelayed(() -> {
-                if (!userStopped && !registered) {
+                if (gen == generation && !userStopped && !registered) {
                     startAttempt();
                 }
             }, 250);
@@ -1163,6 +1474,57 @@ public final class LgTvClient {
                 p.callback.onError(reason);
             }
         }
+        registerId = null;
+    }
+
+    private void clearPending() {
+        for (Pending p : pending.values()) {
+            if (p.timeout != null) {
+                main.removeCallbacks(p.timeout);
+            }
+        }
+        pending.clear();
+        registerId = null;
+    }
+
+    private void setPinState(boolean required, boolean submitting, String error) {
+        if (!required) {
+            submitting = false;
+            error = null;
+        }
+        if (pinPairing == required && pinSubmitting == submitting
+                && Objects.equals(pinError, error)) {
+            return;
+        }
+        pinPairing = required;
+        pinSubmitting = submitting;
+        pinError = error;
+        listener.onPairingPin(required, submitting, error);
+    }
+
+    private static String friendlyPinError(String message) {
+        String lower = message == null ? "" : message.toLowerCase(Locale.US);
+        if (lower.contains("too many pairing")) {
+            return "The TV is busy with another pairing request. Wait a moment and retry.";
+        }
+        if (lower.contains("invalid pin") || lower.contains("rejected")) {
+            return "That PIN didn't match. Check the code on the TV and try again.";
+        }
+        if (lower.contains("did not answer") || lower.contains("timeout")) {
+            return "The TV didn't answer. Try again.";
+        }
+        return "The TV didn't accept that PIN. Try again.";
+    }
+
+    private static String friendlyPairingError(String message) {
+        String lower = message == null ? "" : message.toLowerCase(Locale.US);
+        if (lower.contains("too many pairing")) {
+            return "The TV is busy with another pairing request. Wait a moment and tap Retry.";
+        }
+        if (lower.contains("rejected") || lower.contains("denied")) {
+            return "The TV declined pairing. Tap Retry for a new PIN.";
+        }
+        return "The TV rejected pairing. Tap Retry.";
     }
 
     private void postState(State newState, String detail) {
