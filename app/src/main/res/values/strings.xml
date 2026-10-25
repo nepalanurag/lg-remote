@@ -169,13 +169,14 @@
     <string name="box_input_linked">Box linked to %1$s.</string>
     <string name="box_input_loading">Reading the TV’s inputs… Try again in a moment.</string>
 
-    <string name="tv_keyboard_section">TYPE ON TV</string>
-    <string name="tv_keyboard_box_section">TYPE ON BOX</string>
-    <string name="tv_keyboard_hint">Text for the active screen…</string>
-    <string name="tv_keyboard_help">Select a text field on the TV. The keyboard opens here and text is sent automatically as you type. Backspace deletes in this draft and on the TV once the character has been sent; use Enter only if the app needs it.</string>
-    <string name="tv_keyboard_box_help">Select a search or message field on the box. The keyboard opens here and text is sent automatically as you type through the Android TV remote IME. Backspace deletes in this draft and on the box once the character has been sent.</string>
-    <string name="tv_keyboard_box_unpaired">Pair the Android TV box to type on its apps while this input is active.</string>
-    <string name="tv_keyboard_offline">Connect to the TV to type on it.</string>
+    <string name="tv_keyboard_section">Type on TV</string>
+    <string name="tv_keyboard_box_section">Type on Box</string>
+    <string name="tv_keyboard_hint">Type on TV…</string>
+    <string name="tv_keyboard_box_hint">Type on Android TV…</string>
+    <string name="tv_keyboard_help"></string>
+    <string name="tv_keyboard_box_help"></string>
+    <string name="tv_keyboard_box_unpaired">Pair Android TV box to type in its apps</string>
+    <string name="tv_keyboard_offline">Connect to TV to type</string>
     <string name="tv_keyboard_send">Send text</string>
     <string name="tv_keyboard_delete">Delete a character</string>
     <string name="tv_keyboard_enter">Press enter</string>

@@ -95,7 +95,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private DpadView dpad;
     private TrackpadView trackpad;
     private TextView volumeLabel;
-    private TextView muteLabel;
+    private final List<ImageView> muteIcons = new ArrayList<>();
     private RemoteEditText tvTextField;
     private TextView tvKeyboardLabel;
     private TextView tvKeyboardHint;
@@ -636,15 +636,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         card.setLayoutParams(cardParams);
 
         LinearLayout header = Ui.row(this);
-        tvKeyboardLabel = Ui.label(this, getString(R.string.tv_keyboard_section));
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        tvKeyboardLabel = Ui.text(this, getString(R.string.tv_keyboard_section), 11.5f,
+                getColor(R.color.muted), Typeface.BOLD);
         header.addView(tvKeyboardLabel);
         View spacer = new View(this);
         header.addView(spacer, new LinearLayout.LayoutParams(0, dp(1), 1f));
-        TextView tvSettings = Ui.text(this, getString(R.string.device_settings), 10.5f,
+        TextView tvSettings = Ui.text(this, getString(R.string.device_settings), 11f,
                 getColor(R.color.accent), Typeface.BOLD);
-        tvSettings.setAllCaps(true);
-        tvSettings.setLetterSpacing(0.08f);
-        tvSettings.setPadding(dp(10), dp(6), dp(2), dp(6));
+        tvSettings.setPadding(dp(10), dp(4), dp(2), dp(4));
         tvSettings.setClickable(true);
         tvSettings.setFocusable(true);
         tvSettings.setContentDescription(getString(R.string.device_settings));
@@ -722,12 +722,12 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         thirdParams.leftMargin = dp(7);
         row.addView(send, thirdParams);
 
-        tvKeyboardHint = Ui.text(this, getString(R.string.tv_keyboard_help), 10.5f,
+        tvKeyboardHint = Ui.text(this, "", 11f,
                 getColor(R.color.muted), Typeface.NORMAL);
-        tvKeyboardHint.setLineSpacing(0f, 1.25f);
+        tvKeyboardHint.setVisibility(View.GONE);
         LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        hintParams.topMargin = dp(8);
+        hintParams.topMargin = dp(6);
         card.addView(tvKeyboardHint, hintParams);
         return card;
     }
@@ -808,16 +808,16 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         volume.addView(volumeLabel, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(18)));
 
-        LinearLayout volUp = iconLabelButton(R.drawable.ic_vol_up, getString(R.string.vol_up));
-        LinearLayout volDown = iconLabelButton(R.drawable.ic_vol_down, getString(R.string.vol_down));
-        LinearLayout mute = iconLabelButton(R.drawable.ic_mute, getString(R.string.mute));
+        LinearLayout volUp = iconButton(R.drawable.ic_vol_up, getString(R.string.vol_up));
+        LinearLayout volDown = iconButton(R.drawable.ic_vol_down, getString(R.string.vol_down));
+        LinearLayout mute = iconButton(R.drawable.ic_mute, getString(R.string.mute));
         volume.addView(volUp, volumeButtonParams(6));
         volume.addView(volDown, volumeButtonParams(6));
         volume.addView(mute, volumeButtonParams(0));
         keyControls.add(volUp);
         keyControls.add(volDown);
         keyControls.add(mute);
-        muteLabel = (TextView) mute.getChildAt(1);
+        muteIcons.add((ImageView) mute.getChildAt(0));
         attachRepeat(volUp, () -> sendButton("VOLUMEUP"));
         attachRepeat(volDown, () -> sendButton("VOLUMEDOWN"));
         mute.setOnClickListener(v -> {
@@ -855,9 +855,9 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         transportParams.topMargin = dp(8);
         panel.addView(transport, transportParams);
-        View rewind = wideButton(R.drawable.ic_rewind, getString(R.string.rewind), 11);
-        View play = wideButton(R.drawable.ic_play_pause, getString(R.string.play_pause), 11);
-        View forward = wideButton(R.drawable.ic_forward, getString(R.string.forward), 11);
+        View rewind = wideButton(R.drawable.ic_rewind, getString(R.string.rewind), null, 0);
+        View play = wideButton(R.drawable.ic_play_pause, getString(R.string.play_pause), null, 0);
+        View forward = wideButton(R.drawable.ic_forward, getString(R.string.forward), null, 0);
         transport.addView(rewind, weighted(1f, 54, 0, 8));
         transport.addView(play, weighted(1f, 54, 0, 8));
         transport.addView(forward, weighted(1f, 54, 0, 0));
@@ -908,16 +908,16 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         volume.addView(volumeLabel, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(18)));
 
-        LinearLayout volUp = iconLabelButton(R.drawable.ic_vol_up, getString(R.string.vol_up));
-        LinearLayout volDown = iconLabelButton(R.drawable.ic_vol_down, getString(R.string.vol_down));
-        LinearLayout mute = iconLabelButton(R.drawable.ic_mute, getString(R.string.mute));
+        LinearLayout volUp = iconButton(R.drawable.ic_vol_up, getString(R.string.vol_up));
+        LinearLayout volDown = iconButton(R.drawable.ic_vol_down, getString(R.string.vol_down));
+        LinearLayout mute = iconButton(R.drawable.ic_mute, getString(R.string.mute));
         volume.addView(volUp, volumeButtonParams(6));
         volume.addView(volDown, volumeButtonParams(6));
         volume.addView(mute, volumeButtonParams(0));
         keyControls.add(volUp);
         keyControls.add(volDown);
         keyControls.add(mute);
-        muteLabel = (TextView) mute.getChildAt(1);
+        muteIcons.add((ImageView) mute.getChildAt(0));
         attachRepeat(volUp, () -> sendButton("VOLUMEUP"));
         attachRepeat(volDown, () -> sendButton("VOLUMEDOWN"));
         mute.setOnClickListener(v -> {
@@ -972,9 +972,9 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         keyControls.add(home);
 
         LinearLayout transport = Ui.row(this);
-        View rewind = wideButton(R.drawable.ic_rewind, getString(R.string.rewind), 11);
-        View play = wideButton(R.drawable.ic_play_pause, getString(R.string.play_pause), 11);
-        View forward = wideButton(R.drawable.ic_forward, getString(R.string.forward), 11);
+        View rewind = wideButton(R.drawable.ic_rewind, getString(R.string.rewind), null, 0);
+        View play = wideButton(R.drawable.ic_play_pause, getString(R.string.play_pause), null, 0);
+        View forward = wideButton(R.drawable.ic_forward, getString(R.string.forward), null, 0);
         transport.addView(rewind, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         transport.addView(play, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         transport.addView(forward, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
@@ -1090,12 +1090,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         keyControls.add(home);
 
         LinearLayout volume = Ui.row(this);
-        LinearLayout volUp = iconLabelButton(R.drawable.ic_vol_up, getString(R.string.vol_up));
-        LinearLayout volDown = iconLabelButton(R.drawable.ic_vol_down, getString(R.string.vol_down));
-        LinearLayout mute = iconLabelButton(R.drawable.ic_mute, getString(R.string.mute));
+        LinearLayout volUp = iconButton(R.drawable.ic_vol_up, getString(R.string.vol_up));
+        LinearLayout volDown = iconButton(R.drawable.ic_vol_down, getString(R.string.vol_down));
+        LinearLayout mute = iconButton(R.drawable.ic_mute, getString(R.string.mute));
         volume.addView(volUp, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 6));
         volume.addView(volDown, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 6));
         volume.addView(mute, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
+        muteIcons.add((ImageView) mute.getChildAt(0));
         attachRepeat(volUp, () -> sendButton("VOLUMEUP"));
         attachRepeat(volDown, () -> sendButton("VOLUMEDOWN"));
         mute.setOnClickListener(v -> {
@@ -1283,48 +1284,62 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         return tile;
     }
 
-    private LinearLayout iconLabelButton(int iconRes, String label) {
+    private LinearLayout iconButton(int iconRes, String description) {
         LinearLayout button = Ui.column(this);
         button.setGravity(Gravity.CENTER);
         button.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 14,
                 getColor(R.color.stroke), 1));
         button.setClickable(true);
         button.setFocusable(true);
-        button.setContentDescription(label);
-        button.addView(Ui.icon(this, iconRes, getColor(R.color.text), 20));
-        TextView text = Ui.text(this, label, 9.5f, getColor(R.color.muted), Typeface.BOLD);
-        text.setGravity(Gravity.CENTER);
-        text.setAllCaps(true);
-        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        textParams.topMargin = dp(4);
-        button.addView(text, textParams);
+        button.setContentDescription(description);
+        button.addView(Ui.icon(this, iconRes, getColor(R.color.text), 22));
         return button;
     }
 
-    private View wideButton(int iconRes, String label, float textSize) {
+    private View wideButton(int iconRes, String description, String label, float textSize) {
         LinearLayout button = Ui.row(this);
         button.setGravity(Gravity.CENTER);
         button.setBackground(Ui.pressable(this, getColor(R.color.surface), 16,
                 getColor(R.color.stroke), 1));
         button.setClickable(true);
         button.setFocusable(true);
-        button.setContentDescription(label);
-        button.addView(Ui.icon(this, iconRes, getColor(R.color.text), 18));
-        TextView text = Ui.text(this, label, textSize, getColor(R.color.text), Typeface.BOLD);
-        text.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        textParams.leftMargin = dp(7);
-        button.addView(text, textParams);
+        button.setContentDescription(description);
+        int iconSize = (label == null || label.isEmpty()) ? 22 : 18;
+        button.addView(Ui.icon(this, iconRes, getColor(R.color.text), iconSize));
+        if (label != null && !label.isEmpty()) {
+            TextView text = Ui.text(this, label, textSize, getColor(R.color.text), Typeface.BOLD);
+            text.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            textParams.leftMargin = dp(7);
+            button.addView(text, textParams);
+        }
         return button;
+    }
+
+    private View wideButton(int iconRes, String label, float textSize) {
+        return wideButton(iconRes, label, label, textSize);
     }
 
     // ------------------------------------------------------------------ state
 
     private String savedName() {
         String name = SecureStore.getSavedName(this);
-        return name == null || name.isEmpty() ? getString(R.string.device_unknown) : name;
+        return name == null || name.isEmpty() ? getString(R.string.device_unknown) : cleanName(name);
+    }
+
+    private static String cleanName(String name) {
+        if (name == null || name.isEmpty()) {
+            return "";
+        }
+        String cleaned = name.trim();
+        if (cleaned.startsWith("[LG] webOS TV ")) {
+            return "LG " + cleaned.substring("[LG] webOS TV ".length());
+        }
+        if (cleaned.startsWith("[LG] ")) {
+            return "LG " + cleaned.substring("[LG] ".length());
+        }
+        return cleaned;
     }
 
     private void showSetup(boolean choose) {
@@ -1351,8 +1366,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (service == null) {
             String ip = SecureStore.getSavedIp(this);
             headerTitle.setText(savedName());
-            headerSubtitle.setText(ip == null ? getString(R.string.not_connected)
-                    : getString(R.string.connecting_to, ip));
+            headerSubtitle.setText(R.string.connecting);
             styleDot(getColor(R.color.amber));
             setPowerBadge("…", getColor(R.color.muted),
                     getColor(R.color.surface_2), getColor(R.color.stroke));
@@ -1361,34 +1375,30 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
         String ip = service.getIp();
         String name = service.displayName();
-        headerTitle.setText(name);
+        headerTitle.setText(cleanName(name));
         LgTvClient.State state = service.getState();
         String detail = service.getDetail();
         updatePowerBadge(state);
         switch (state) {
             case READY:
                 styleDot(getColor(R.color.green));
-                headerSubtitle.setText(readyDetail(ip)
-                        + (service.isPointerReady() ? "" : " · preparing keys…"));
+                headerSubtitle.setText(readyDetail());
                 hideBanner();
                 break;
             case CONNECTING:
                 styleDot(getColor(R.color.amber));
-                headerSubtitle.setText(ip == null ? getString(R.string.connecting)
-                        : getString(R.string.connecting_to, ip));
+                headerSubtitle.setText(R.string.connecting);
                 hideBanner();
                 break;
             case PAIRING:
                 styleDot(getColor(R.color.violet));
                 tintBanner(getColor(R.color.violet));
                 if (service.isPairingPinRequired()) {
-                    headerSubtitle.setText(getString(R.string.pairing_pin_header)
-                            + (ip == null ? "" : " · " + ip));
+                    headerSubtitle.setText(R.string.pairing_pin_header);
                     showBanner(getString(R.string.pairing_pin_banner),
                             getString(R.string.pairing_pin_open), this::showPairingPinDialog);
                 } else {
-                    headerSubtitle.setText(getString(R.string.approve_tv)
-                            + (ip == null ? "" : " · " + ip));
+                    headerSubtitle.setText(R.string.approve_tv);
                     showBanner(getString(R.string.pairing_banner), null, null);
                 }
                 break;
@@ -1407,8 +1417,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             case IDLE:
             default:
                 styleDot(getColor(R.color.muted));
-                headerSubtitle.setText(ip == null ? getString(R.string.not_connected)
-                        : getString(R.string.not_connected) + " · " + ip);
+                headerSubtitle.setText(R.string.not_connected);
                 if (ip != null) {
                     tintBanner(getColor(R.color.stroke));
                     showBanner(getString(R.string.disconnected_banner),
@@ -1425,23 +1434,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
     }
 
-    private String readyDetail(String ip) {
+    private String readyDetail() {
         StringBuilder line = new StringBuilder(
                 service == null ? getString(R.string.connected) : service.getTvPowerLabel());
         String input = service == null ? null : service.getActiveInputLabel();
-        String address = ip;
         if (service != null && service.isBoxActive()) {
             input = getString(R.string.android_tv_box);
-            String boxHost = SecureStore.getBoxHost(this);
-            if (boxHost != null && !boxHost.isEmpty()) {
-                address = boxHost;
-            }
         }
         if (input != null && !input.isEmpty()) {
             line.append(" · ").append(input);
-        }
-        if (address != null && !address.isEmpty()) {
-            line.append(" · ").append(address);
         }
         return line.toString();
     }
@@ -1548,6 +1549,10 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             view.setEnabled(ready);
             view.setAlpha(ready ? 1f : 0.42f);
         }
+        if (tvTextField != null) {
+            tvTextField.setHint(boxActive
+                    ? R.string.tv_keyboard_box_hint : R.string.tv_keyboard_hint);
+        }
         if (tvKeyboardLabel != null) {
             tvKeyboardLabel.setText(getString(boxActive
                     ? R.string.tv_keyboard_box_section : R.string.tv_keyboard_section));
@@ -1555,12 +1560,12 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (tvKeyboardHint != null) {
             if (!connected) {
                 tvKeyboardHint.setText(R.string.tv_keyboard_offline);
+                tvKeyboardHint.setVisibility(View.VISIBLE);
             } else if (boxActive && !boxReady) {
                 tvKeyboardHint.setText(R.string.tv_keyboard_box_unpaired);
-            } else if (boxActive) {
-                tvKeyboardHint.setText(R.string.tv_keyboard_box_help);
+                tvKeyboardHint.setVisibility(View.VISIBLE);
             } else {
-                tvKeyboardHint.setText(R.string.tv_keyboard_help);
+                tvKeyboardHint.setVisibility(View.GONE);
             }
         }
     }
@@ -1614,10 +1619,16 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     @Override
     public void onVolume(int volume, boolean muted) {
         if (volumeLabel != null) {
-            volumeLabel.setText(volume >= 0 ? String.format(Locale.US, "VOL %d", volume) : "VOL");
+            if (muted) {
+                volumeLabel.setText(R.string.muted);
+                volumeLabel.setTextColor(getColor(R.color.danger));
+            } else {
+                volumeLabel.setText(volume >= 0 ? String.format(Locale.US, "VOL %d", volume) : "VOL");
+                volumeLabel.setTextColor(getColor(R.color.muted));
+            }
         }
-        if (muteLabel != null) {
-            muteLabel.setText(muted ? getString(R.string.muted) : getString(R.string.mute));
+        for (ImageView icon : muteIcons) {
+            icon.setColorFilter(getColor(muted ? R.color.danger : R.color.text));
         }
     }
 
