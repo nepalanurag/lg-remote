@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothHidDevice;
+import android.bluetooth.BluetoothHidDeviceAppQosSettings;
 import android.bluetooth.BluetoothHidDeviceAppSdpSettings;
 import android.bluetooth.BluetoothProfile;
 import android.content.Context;
@@ -30,39 +31,79 @@ import java.util.concurrent.TimeUnit;
  */
 public final class BoxBluetoothMouse {
     private static final String TAG = "LgRemote";
-    private static final int REPORT_ID = 1;
+    public static final byte REPORT_ID_KEYBOARD = 1;
+    public static final byte REPORT_ID_MOUSE = 2;
+    public static final byte REPORT_ID_BATTERY = 32;
 
-    // Standard USB HID Mouse report descriptor: 1-byte buttons (left/right/middle), 1-byte X, 1-byte Y, 1-byte wheel.
-    private static final byte[] MOUSE_REPORT_DESCRIPTOR = {
-            (byte) 0x05, (byte) 0x01, // USAGE_PAGE (Generic Desktop)
-            (byte) 0x09, (byte) 0x02, // USAGE (Mouse)
-            (byte) 0xA1, (byte) 0x01, // COLLECTION (Application)
-            (byte) 0x85, (byte) 0x01, //   REPORT_ID (1)
-            (byte) 0x09, (byte) 0x01, //   USAGE (Pointer)
-            (byte) 0xA1, (byte) 0x00, //   COLLECTION (Physical)
-            (byte) 0x05, (byte) 0x09, //     USAGE_PAGE (Button)
-            (byte) 0x19, (byte) 0x01, //     USAGE_MINIMUM (Button 1)
-            (byte) 0x29, (byte) 0x03, //     USAGE_MAXIMUM (Button 3)
-            (byte) 0x15, (byte) 0x00, //     LOGICAL_MINIMUM (0)
-            (byte) 0x25, (byte) 0x01, //     LOGICAL_MAXIMUM (1)
-            (byte) 0x95, (byte) 0x03, //     REPORT_COUNT (3)
-            (byte) 0x75, (byte) 0x01, //     REPORT_SIZE (1)
-            (byte) 0x81, (byte) 0x02, //     INPUT (Data,Var,Abs)
-            (byte) 0x95, (byte) 0x01, //     REPORT_COUNT (1)
-            (byte) 0x75, (byte) 0x05, //     REPORT_SIZE (5)
-            (byte) 0x81, (byte) 0x03, //     INPUT (Cnst,Var,Abs)
-            (byte) 0x05, (byte) 0x01, //     USAGE_PAGE (Generic Desktop)
-            (byte) 0x09, (byte) 0x30, //     USAGE (X)
-            (byte) 0x09, (byte) 0x31, //     USAGE (Y)
-            (byte) 0x09, (byte) 0x38, //     USAGE (Wheel)
-            (byte) 0x15, (byte) 0x81, //     LOGICAL_MINIMUM (-127)
-            (byte) 0x25, (byte) 0x7F, //     LOGICAL_MAXIMUM (127)
-            (byte) 0x75, (byte) 0x08, //     REPORT_SIZE (8)
-            (byte) 0x95, (byte) 0x03, //     REPORT_COUNT (3)
-            (byte) 0x81, (byte) 0x06, //     INPUT (Data,Var,Rel)
-            (byte) 0xC0,             //   END_COLLECTION
-            (byte) 0xC0              // END_COLLECTION
+    private static final byte[] COMBO_REPORT_DESCRIPTOR = {
+            // Keyboard
+            (byte) 0x05, (byte) 0x01, // Usage page (Generic Desktop)
+            (byte) 0x09, (byte) 0x06, // Usage (Keyboard)
+            (byte) 0xA1, (byte) 0x01, // Collection (Application)
+            (byte) 0x85, REPORT_ID_KEYBOARD, // Report ID (1)
+            (byte) 0x05, (byte) 0x07, // Usage page (Key Codes)
+            (byte) 0x19, (byte) 0xE0, // Usage minimum (224)
+            (byte) 0x29, (byte) 0xE7, // Usage maximum (231)
+            (byte) 0x15, (byte) 0x00, // Logical minimum (0)
+            (byte) 0x25, (byte) 0x01, // Logical maximum (1)
+            (byte) 0x75, (byte) 0x01, // Report size (1)
+            (byte) 0x95, (byte) 0x08, // Report count (8)
+            (byte) 0x81, (byte) 0x02, // Input (Data, Variable, Absolute)
+            (byte) 0x75, (byte) 0x08, // Report size (8)
+            (byte) 0x95, (byte) 0x01, // Report count (1)
+            (byte) 0x81, (byte) 0x01, // Input (Constant)
+            (byte) 0x75, (byte) 0x08, // Report size (8)
+            (byte) 0x95, (byte) 0x06, // Report count (6)
+            (byte) 0x15, (byte) 0x00, // Logical Minimum (0)
+            (byte) 0x25, (byte) 0x65, // Logical Maximum (101)
+            (byte) 0x05, (byte) 0x07, // Usage page (Key Codes)
+            (byte) 0x19, (byte) 0x00, // Usage Minimum (0)
+            (byte) 0x29, (byte) 0x65, // Usage Maximum (101)
+            (byte) 0x81, (byte) 0x00, // Input (Data, Array)
+            (byte) 0xC0,              // End Collection
+
+            // Mouse
+            (byte) 0x05, (byte) 0x01, // Usage Page (Generic Desktop)
+            (byte) 0x09, (byte) 0x02, // Usage (Mouse)
+            (byte) 0xA1, (byte) 0x01, // Collection (Application)
+            (byte) 0x85, REPORT_ID_MOUSE, // Report ID (2)
+            (byte) 0x09, (byte) 0x01, // Usage (Pointer)
+            (byte) 0xA1, (byte) 0x00, // Collection (Physical)
+            (byte) 0x05, (byte) 0x09, // Usage Page (Buttons)
+            (byte) 0x19, (byte) 0x01, // Usage minimum (1)
+            (byte) 0x29, (byte) 0x03, // Usage maximum (3)
+            (byte) 0x15, (byte) 0x00, // Logical minimum (0)
+            (byte) 0x25, (byte) 0x01, // Logical maximum (1)
+            (byte) 0x75, (byte) 0x01, // Report size (1)
+            (byte) 0x95, (byte) 0x03, // Report count (3)
+            (byte) 0x81, (byte) 0x02, // Input (Data, Variable, Absolute)
+            (byte) 0x75, (byte) 0x05, // Report size (5)
+            (byte) 0x95, (byte) 0x01, // Report count (1)
+            (byte) 0x81, (byte) 0x01, // Input (constant)
+            (byte) 0x05, (byte) 0x01, // Usage page (Generic Desktop)
+            (byte) 0x09, (byte) 0x30, // Usage (X)
+            (byte) 0x09, (byte) 0x31, // Usage (Y)
+            (byte) 0x09, (byte) 0x38, // Usage (Wheel)
+            (byte) 0x15, (byte) 0x81, // Logical minimum (-127)
+            (byte) 0x25, (byte) 0x7F, // Logical maximum (127)
+            (byte) 0x75, (byte) 0x08, // Report size (8)
+            (byte) 0x95, (byte) 0x03, // Report count (3)
+            (byte) 0x81, (byte) 0x06, // Input (Data, Variable, Relative)
+            (byte) 0xC0,              // End Collection
+            (byte) 0xC0               // End Collection
     };
+
+    private static final BluetoothHidDeviceAppQosSettings QOS_OUT = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+            ? new BluetoothHidDeviceAppQosSettings(
+                    BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT,
+                    800,
+                    9,
+                    0,
+                    11250,
+                    BluetoothHidDeviceAppQosSettings.MAX)
+            : null;
+
+    private final byte[] lastMouseReport = new byte[]{0, 0, 0, 0};
 
     public interface Listener {
         void onBluetoothMouseStatusChanged();
@@ -142,26 +183,37 @@ public final class BoxBluetoothMouse {
 
         @Override
         public void onGetReport(BluetoothDevice device, byte type, byte id, int bufferSize) {
-            if (hidDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                if (hasPermission()) {
-                    try {
-                        hidDevice.replyReport(device, type, id, new byte[]{0, 0, 0, 0});
-                    } catch (SecurityException ignored) {
+            if (hidDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hasPermission()) {
+                try {
+                    if (type != BluetoothHidDevice.REPORT_TYPE_INPUT) {
+                        hidDevice.reportError(device, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ);
+                        return;
                     }
+                    if (id == REPORT_ID_MOUSE) {
+                        hidDevice.replyReport(device, type, id, lastMouseReport);
+                    } else if (id == REPORT_ID_KEYBOARD) {
+                        hidDevice.replyReport(device, type, id, new byte[8]);
+                    } else {
+                        hidDevice.reportError(device, BluetoothHidDevice.ERROR_RSP_INVALID_RPT_ID);
+                    }
+                } catch (SecurityException ignored) {
                 }
             }
         }
 
         @Override
         public void onSetReport(BluetoothDevice device, byte type, byte id, byte[] data) {
-            if (hidDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                if (hasPermission()) {
-                    try {
-                        hidDevice.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS);
-                    } catch (SecurityException ignored) {
-                    }
+            if (hidDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hasPermission()) {
+                try {
+                    hidDevice.reportError(device, BluetoothHidDevice.ERROR_RSP_SUCCESS);
+                } catch (SecurityException ignored) {
                 }
             }
+        }
+
+        @Override
+        public void onSetProtocol(BluetoothDevice device, byte protocol) {
+            Log.d(TAG, "Bluetooth HID onSetProtocol: device=" + device + " protocol=" + protocol);
         }
     } : null;
 
@@ -315,14 +367,14 @@ public final class BoxBluetoothMouse {
             return;
         }
         BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
-                "LG Remote Mouse",
-                "Android TV Bluetooth Mouse",
                 "LG Remote",
-                BluetoothHidDevice.SUBCLASS1_MOUSE,
-                MOUSE_REPORT_DESCRIPTOR
+                "Android TV Input",
+                "LG Remote",
+                BluetoothHidDevice.SUBCLASS1_COMBO,
+                COMBO_REPORT_DESCRIPTOR
         );
         try {
-            hidDevice.registerApp(sdp, null, null, executor, hidCallback);
+            hidDevice.registerApp(sdp, null, QOS_OUT, executor, hidCallback);
         } catch (SecurityException e) {
             Log.w(TAG, "Cannot register Bluetooth HID app: " + e.getMessage());
         }
@@ -335,8 +387,12 @@ public final class BoxBluetoothMouse {
         byte buttons = (byte) (buttonDown ? 0x01 : 0x00);
         byte rx = (byte) Math.max(-127, Math.min(127, dx));
         byte ry = (byte) Math.max(-127, Math.min(127, dy));
+        lastMouseReport[0] = buttons;
+        lastMouseReport[1] = rx;
+        lastMouseReport[2] = ry;
+        lastMouseReport[3] = 0;
         try {
-            return hidDevice.sendReport(connectedDevice, REPORT_ID, new byte[]{buttons, rx, ry, 0});
+            return hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, lastMouseReport);
         } catch (SecurityException e) {
             return false;
         }
@@ -347,17 +403,22 @@ public final class BoxBluetoothMouse {
             return false;
         }
         try {
-            // Button 1 down
-            boolean ok = hidDevice.sendReport(connectedDevice, REPORT_ID, new byte[]{0x01, 0, 0, 0});
-            // Button 1 up after 35ms
+            // Button 1 down immediately
+            lastMouseReport[0] = 0x01;
+            lastMouseReport[1] = 0;
+            lastMouseReport[2] = 0;
+            lastMouseReport[3] = 0;
+            boolean ok = hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x01, 0, 0, 0});
+            // Button 1 up after 15ms for zero perceptible latency
             executor.schedule(() -> {
                 if (isConnected() && hasPermission()) {
                     try {
-                        hidDevice.sendReport(connectedDevice, REPORT_ID, new byte[]{0x00, 0, 0, 0});
+                        lastMouseReport[0] = 0x00;
+                        hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0x00, 0, 0, 0});
                     } catch (SecurityException ignored) {
                     }
                 }
-            }, 35, TimeUnit.MILLISECONDS);
+            }, 15, TimeUnit.MILLISECONDS);
             return ok;
         } catch (SecurityException e) {
             return false;
@@ -368,9 +429,14 @@ public final class BoxBluetoothMouse {
         if (!isConnected() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !hasPermission()) {
             return false;
         }
-        byte wheel = (byte) Math.max(-127, Math.min(127, dy));
+        // Invert dy for natural scrolling (swiping fingers up pushes content up / scrolls down)
+        byte wheel = (byte) Math.max(-127, Math.min(127, -dy));
+        lastMouseReport[0] = 0;
+        lastMouseReport[1] = 0;
+        lastMouseReport[2] = 0;
+        lastMouseReport[3] = wheel;
         try {
-            return hidDevice.sendReport(connectedDevice, REPORT_ID, new byte[]{0, 0, 0, wheel});
+            return hidDevice.sendReport(connectedDevice, REPORT_ID_MOUSE, new byte[]{0, 0, 0, wheel});
         } catch (SecurityException e) {
             return false;
         }
