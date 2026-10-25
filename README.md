@@ -22,6 +22,7 @@ Java only. Package `com.nepalanurag.lgremote`. Minimum Android 8.0 (API 26), tar
 **Controls the Android TV box**
 - Pairing over the Google TV / Android TV Remote protocol v2
 - D-pad, OK, Back, Home, Settings, playback keys
+- Context-aware pointer: Bluetooth HID Mouse emulation provides a native on-screen cursor on the Android TV box without touching or displaying the LG TV cursor
 - Text entry, delete and Enter through the Android TV remote IME
 - mDNS discovery, with a saved host tried first and manual IP as the fallback
 

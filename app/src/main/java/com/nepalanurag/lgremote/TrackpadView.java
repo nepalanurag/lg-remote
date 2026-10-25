@@ -39,6 +39,9 @@ public final class TrackpadView extends View {
     private Listener listener;
     private float speed = 1.6f;
     private boolean haptics = true;
+    private String tagLabel = "TRACKPAD";
+    private String hintLabel;
+    private String subLabel;
     private boolean touching;
     private boolean dragging;
     private boolean scrolling;
@@ -109,6 +112,13 @@ public final class TrackpadView extends View {
         haptics = enabled;
     }
 
+    public void setLabels(String tag, String hint, String sub) {
+        this.tagLabel = tag != null ? tag : "TRACKPAD";
+        this.hintLabel = hint;
+        this.subLabel = sub;
+        invalidate();
+    }
+
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         panel.set(Ui.dp(getContext(), 1), Ui.dp(getContext(), 1),
@@ -124,15 +134,16 @@ public final class TrackpadView extends View {
         stroke.setColor(getContext().getColor(touching ? R.color.accent_dim : R.color.stroke));
         canvas.drawRoundRect(panel, radius, radius, stroke);
 
-        canvas.drawText("TRACKPAD", Ui.dp(getContext(), 18),
+        canvas.drawText(tagLabel, Ui.dp(getContext(), 18),
                 Ui.dp(getContext(), 26), tag);
 
         if (!touching) {
             float midY = getHeight() / 2f;
             float midX = getWidth() / 2f;
-            canvas.drawText(getContext().getString(R.string.trackpad_hint),
-                    midX, midY - Ui.dp(getContext(), 4), hint);
-            canvas.drawText("Tap to click", midX, midY + Ui.dp(getContext(), 18), sub);
+            String hText = hintLabel != null ? hintLabel : getContext().getString(R.string.trackpad_hint);
+            String sText = subLabel != null ? subLabel : "Tap to click";
+            canvas.drawText(hText, midX, midY - Ui.dp(getContext(), 4), hint);
+            canvas.drawText(sText, midX, midY + Ui.dp(getContext(), 18), sub);
         } else {
             canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), 20), dotGlow);
             canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), dragging ? 7 : 5), dot);

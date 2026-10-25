@@ -42,6 +42,7 @@ import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Space;
 import android.widget.Switch;
+import android.bluetooth.BluetoothAdapter;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -1205,6 +1206,8 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (!buttons) {
             trackpad.setPointerSpeed(SecureStore.getPointerSpeed(this));
             trackpad.setHaptics(SecureStore.getHaptics(this));
+            ensureBluetoothPermission();
+            updateTrackpadLabels();
         }
     }
 
@@ -1536,6 +1539,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
         refreshTextBar(connected);
         updateTvAppsLabels();
+        updateTrackpadLabels();
     }
 
     private void refreshTextBar(boolean connected) {
@@ -1794,13 +1798,79 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
     // ------------------------------------------------------------------ actions
 
-    /** A trackpad/click tap clicks the on-screen pointer. */
+    @Override
+    public void onBoxMouseStatus() {
+        updateTrackpadLabels();
+    }
+
+    private void updateTrackpadLabels() {
+        if (trackpad == null) {
+            return;
+        }
+        if (service != null && service.isBoxActive()) {
+            boolean mouseConnected = service.isBoxMouseConnected();
+            if (mouseConnected) {
+                trackpad.setLabels("BOX MOUSE", getString(R.string.trackpad_hint), "Tap to click · two fingers scroll");
+            } else {
+                trackpad.setLabels("BOX MOUSE", "Bluetooth Mouse Not Connected", "Tap to pair with Android TV box");
+            }
+        } else {
+            trackpad.setLabels("TRACKPAD", getString(R.string.trackpad_hint), "Tap to click");
+        }
+    }
+
+    /** A trackpad/click tap clicks the on-screen pointer or opens pair dialog if unlinked. */
     private void pointerClickPressed() {
         if (service == null) {
             return;
         }
         clickHaptic(trackpad);
+        if (service.isBoxActive() && !service.isBoxMouseConnected()) {
+            showBluetoothMousePairDialog();
+            return;
+        }
         service.sendClick();
+    }
+
+    private void showBluetoothMousePairDialog() {
+        ensureBluetoothPermission();
+        String phoneName = "this phone";
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+            BluetoothAdapter bt = BluetoothAdapter.getDefaultAdapter();
+            try {
+                if (bt != null && bt.getName() != null) {
+                    phoneName = bt.getName();
+                }
+            } catch (SecurityException ignored) {
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Android TV Mouse")
+                .setMessage("To control the cursor on your Android TV box, pair this phone as a Bluetooth mouse:\n\n"
+                        + "1. On Android TV, open Settings → Remotes & Accessories.\n"
+                        + "2. Choose 'Add accessory' or 'Pair remote'.\n"
+                        + "3. Tap 'Make Discoverable' below.\n"
+                        + "4. Select '" + phoneName + "' on your TV screen.")
+                .setPositiveButton("Make Discoverable", (dialog, which) -> {
+                    BoxBluetoothMouse.requestDiscoverable(this);
+                    if (service != null && service.getBoxMouse() != null) {
+                        service.getBoxMouse().start();
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void ensureBluetoothPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                        Manifest.permission.BLUETOOTH_ADVERTISE
+                }, 102);
+            }
+        }
     }
 
     private void sendButton(String name) {

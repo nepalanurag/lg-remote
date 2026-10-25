@@ -55,6 +55,9 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
 
         /** Box text-field focus, detected over the Android TV remote IME session. */
         void onBoxTextField(boolean focused, String label);
+
+        default void onBoxMouseStatus() {
+        }
     }
 
     public final class LocalBinder extends Binder {
@@ -91,6 +94,7 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
     private boolean foreground;
     private LgRemoteController lgController;
     private BoxRemoteController boxController;
+    private BoxBluetoothMouse boxMouse;
 
     @Override
     public void onCreate() {
@@ -102,6 +106,9 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         tvName = SecureStore.getSavedName(this);
         lgController = new LgRemoteController(this);
         boxController = new BoxRemoteController(this, lgController);
+        boxMouse = new BoxBluetoothMouse(this);
+        boxMouse.setListener(this::notifyBoxMouseStatus);
+        boxMouse.start();
     }
 
     @Override
@@ -210,6 +217,9 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
 
     @Override
     public void onDestroy() {
+        if (boxMouse != null) {
+            boxMouse.stop();
+        }
         if (boxController != null) {
             boxController.shutdown();
         } else {
@@ -569,15 +579,38 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
     }
 
     public boolean sendClick() {
+        if (isBoxActive()) {
+            return boxMouse != null && boxMouse.sendClick();
+        }
         return client.sendClick();
     }
 
     public boolean sendMove(int dx, int dy, boolean down) {
+        if (isBoxActive()) {
+            return boxMouse != null && boxMouse.sendMove(dx, dy, down);
+        }
         return client.sendMove(dx, dy, down);
     }
 
     public boolean sendScroll(int dx, int dy) {
+        if (isBoxActive()) {
+            return boxMouse != null && boxMouse.sendScroll(dx, dy);
+        }
         return client.sendScroll(dx, dy);
+    }
+
+    public BoxBluetoothMouse getBoxMouse() {
+        return boxMouse;
+    }
+
+    public boolean isBoxMouseConnected() {
+        return boxMouse != null && boxMouse.isConnected();
+    }
+
+    private void notifyBoxMouseStatus() {
+        for (Listener listener : listeners) {
+            listener.onBoxMouseStatus();
+        }
     }
 
     public boolean wakeOnLan() {
