@@ -32,8 +32,12 @@ public final class TrackpadView extends View {
     private final Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint dotGlow = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint tag = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint scrollPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF panel = new RectF();
+    private final RectF scrollTrack = new RectF();
     private final int touchSlop;
+    private int scrollStripWidth;
+    private boolean isScrollingStrip = false;
 
     private Listener listener;
     private float speed = 1.6f;
@@ -74,7 +78,7 @@ public final class TrackpadView extends View {
         setClickable(true);
         setFocusable(true);
         setContentDescription("Trackpad");
-        fill.setColor(getContext().getColor(R.color.surface));
+        fill.setColor(getContext().getColor(R.color.surface_2));
         stroke.setStyle(Paint.Style.STROKE);
         stroke.setStrokeWidth(Ui.dp(getContext(), 1));
         stroke.setColor(getContext().getColor(R.color.stroke));
@@ -95,6 +99,10 @@ public final class TrackpadView extends View {
         tag.setTextSize(Ui.dp(getContext(), 9));
         tag.setTypeface(android.graphics.Typeface.create("sans-serif",
                 android.graphics.Typeface.BOLD));
+        scrollStripWidth = Ui.dp(getContext(), 36);
+        scrollPaint.setColor(getContext().getColor(R.color.muted));
+        scrollPaint.setTextAlign(Paint.Align.CENTER);
+        scrollPaint.setTextSize(Ui.dp(getContext(), 10));
     }
 
     public void setListener(Listener listener) {
@@ -120,7 +128,9 @@ public final class TrackpadView extends View {
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         panel.set(Ui.dp(getContext(), 1), Ui.dp(getContext(), 1),
                 w - Ui.dp(getContext(), 1), h - Ui.dp(getContext(), 1));
-        dotX = w / 2f;
+        scrollTrack.set(w - scrollStripWidth, Ui.dp(getContext(), 8),
+                w - Ui.dp(getContext(), 6), h - Ui.dp(getContext(), 8));
+        dotX = (w - scrollStripWidth) / 2f;
         dotY = h / 2f;
     }
 
@@ -134,14 +144,34 @@ public final class TrackpadView extends View {
         canvas.drawText(tagLabel, Ui.dp(getContext(), 18),
                 Ui.dp(getContext(), 26), tag);
 
+        // Right Edge Scroll Strip
+        float sepX = getWidth() - scrollStripWidth;
+        stroke.setColor(getContext().getColor(R.color.stroke));
+        canvas.drawLine(sepX, Ui.dp(getContext(), 14), sepX, getHeight() - Ui.dp(getContext(), 14), stroke);
+
+        float scrollMidX = sepX + scrollStripWidth / 2f;
+        float h = getHeight();
+        scrollPaint.setColor(getContext().getColor(isScrollingStrip ? R.color.accent : R.color.muted));
+        canvas.drawText("▲", scrollMidX, Ui.dp(getContext(), 28), scrollPaint);
+        canvas.drawText("▼", scrollMidX, h - Ui.dp(getContext(), 20), scrollPaint);
+
+        // Center scroll track indicator
+        float pillW = Ui.dp(getContext(), 3);
+        float pillH = Ui.dp(getContext(), 24);
+        float pillTop = (h - pillH) / 2f;
+        stroke.setStrokeWidth(pillW);
+        stroke.setColor(getContext().getColor(isScrollingStrip ? R.color.accent : R.color.stroke));
+        canvas.drawLine(scrollMidX, pillTop, scrollMidX, pillTop + pillH, stroke);
+        stroke.setStrokeWidth(Ui.dp(getContext(), 1));
+
         if (!touching) {
             float midY = getHeight() / 2f;
-            float midX = getWidth() / 2f;
+            float midX = (getWidth() - scrollStripWidth) / 2f;
             String hText = hintLabel != null ? hintLabel : getContext().getString(R.string.trackpad_hint);
-            String sText = subLabel != null ? subLabel : "Tap to click · 2-finger scroll";
+            String sText = subLabel != null ? subLabel : "Tap to click · Scroll bar on right";
             canvas.drawText(hText, midX, midY - Ui.dp(getContext(), 4), hint);
             canvas.drawText(sText, midX, midY + Ui.dp(getContext(), 18), sub);
-        } else {
+        } else if (!isScrollingStrip) {
             canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), 20), dotGlow);
             canvas.drawCircle(dotX, dotY, Ui.dp(getContext(), 5), dot);
         }
@@ -163,12 +193,17 @@ public final class TrackpadView extends View {
                 downAt = System.currentTimeMillis();
                 accX = 0;
                 accY = 0;
+                isScrollingStrip = (event.getX() >= getWidth() - scrollStripWidth);
+                if (isScrollingStrip) {
+                    haptic(HapticFeedbackConstants.CLOCK_TICK);
+                }
                 invalidate();
                 return true;
 
             case MotionEvent.ACTION_POINTER_DOWN:
                 if (event.getPointerCount() >= 2) {
                     multiTouch = true;
+                    isScrollingStrip = false;
                     scrollLastX = averageX(event);
                     scrollLastY = averageY(event);
                     scrollAccX = 0;
@@ -180,6 +215,23 @@ public final class TrackpadView extends View {
                 return true;
 
             case MotionEvent.ACTION_MOVE:
+                if (isScrollingStrip) {
+                    float y = event.getY();
+                    float dy = y - lastY;
+                    lastY = y;
+                    scrollAccY += (-dy) * 0.85f;
+                    int sy = (int) scrollAccY;
+                    if (sy != 0) {
+                        scrollAccY -= sy;
+                        if (listener != null) {
+                            listener.onScroll(0, sy);
+                        }
+                        haptic(HapticFeedbackConstants.CLOCK_TICK);
+                    }
+                    invalidate();
+                    return true;
+                }
+
                 if (multiTouch) {
                     if (event.getPointerCount() >= 2) {
                         float x = averageX(event);
@@ -190,7 +242,6 @@ public final class TrackpadView extends View {
                         scrollLastY = y;
                         twoFingerMove += Math.hypot(dx, dy);
 
-                        // Accumulate natural scroll deltas (positive sy when swiping up)
                         scrollAccX += dx * 0.65f;
                         scrollAccY += (-dy) * 0.65f;
                         int sx = (int) scrollAccX;
@@ -242,10 +293,13 @@ public final class TrackpadView extends View {
                         haptic(HapticFeedbackConstants.CONTEXT_CLICK);
                     }
                 }
-                // Lock cursor movement when lifting multi-touch fingers to prevent jumping
                 return true;
 
             case MotionEvent.ACTION_UP:
+                if (isScrollingStrip) {
+                    ending();
+                    return true;
+                }
                 boolean tap = !multiTouch && totalMove < touchSlop
                         && System.currentTimeMillis() - downAt < 500;
                 if (tap) {
@@ -269,6 +323,7 @@ public final class TrackpadView extends View {
     private void ending() {
         touching = false;
         multiTouch = false;
+        isScrollingStrip = false;
         invalidate();
     }
 

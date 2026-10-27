@@ -18,6 +18,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /** Owns the long-lived SSAP connection, so it survives rotation and the app going to the background. */
@@ -118,8 +119,22 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
             disconnectAndStop();
             return START_NOT_STICKY;
         }
+
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            ensureForeground();
+            if (boxController != null) {
+                boxController.setActive(true);
+            }
+            if (boxMouse != null && !boxMouse.isConnected()) {
+                boxMouse.autoConnect();
+            }
+            updateNotification();
+            return START_STICKY;
+        }
+
         if (ACTION_RECONNECT.equals(action)) {
-            if (client.getIp() != null) {
+            if (client != null && client.getIp() != null) {
                 client.reconnectNow();
             } else if (ip != null) {
                 connectInternal(ip, tvName);
@@ -149,7 +164,7 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         ip = wantedIp;
         tvName = wantedName;
         ensureForeground();
-        if (client.isConnected() && wantedIp.equals(client.getIp())) {
+        if (client != null && client.isConnected() && wantedIp.equals(client.getIp())) {
             updateNotification();
             return START_STICKY;
         }
@@ -279,6 +294,10 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
     }
 
     public String displayName() {
+        if (SecureStore.getDeviceMode(this) == SecureStore.MODE_ANDROID_TV) {
+            String boxName = SecureStore.getBoxName(this);
+            return (boxName != null && !boxName.isEmpty()) ? boxName : "Android TV";
+        }
         if (tvName != null && !tvName.isEmpty()) {
             return tvName;
         }
@@ -302,6 +321,9 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
     }
 
     public boolean isConnected() {
+        if (SecureStore.getDeviceMode(this) == SecureStore.MODE_ANDROID_TV) {
+            return isBoxPaired();
+        }
         return state == LgTvClient.State.READY;
     }
 
@@ -415,7 +437,7 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         }
     }
 
-    private void updateActiveControllers() {
+    public void updateActiveControllers() {
         if (boxController != null) {
             boolean active = state == LgTvClient.State.READY && isBoxActive();
             boxController.setActive(active);
@@ -477,6 +499,36 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         return null;
     }
 
+    /** Display title of the active app or HDMI input currently on screen. */
+    public String getActiveAppTitle() {
+        if (foregroundApp == null || foregroundApp.isEmpty()) {
+            return null;
+        }
+        for (LgTvClient.TvInput input : inputs) {
+            if (foregroundApp.equals(input.appId) || foregroundApp.equals(input.id)) {
+                return input.label;
+            }
+        }
+        for (LgTvClient.TvApp app : apps) {
+            if (foregroundApp.equals(app.id)) {
+                return app.title;
+            }
+        }
+        if (foregroundApp.contains("youtube")) {
+            return "YouTube";
+        }
+        if (foregroundApp.contains("netflix")) {
+            return "Netflix";
+        }
+        if (foregroundApp.contains("amazon")) {
+            return "Prime Video";
+        }
+        if (foregroundApp.contains("home")) {
+            return "LG Home";
+        }
+        return foregroundApp;
+    }
+
     /** The external input that is currently on screen, or null when a webOS app is in front. */
     public LgTvClient.TvInput getActiveInput() {
         if (foregroundApp == null || foregroundApp.isEmpty()) {
@@ -490,13 +542,79 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
         return null;
     }
 
-    /** True while the HDMI input linked to the Android TV box is active. */
+    /** True while the Android TV box is active (either exclusively or on its active HDMI input). */
     public boolean isBoxActive() {
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            return true;
+        }
+        if (mode == SecureStore.MODE_LG_TV) {
+            return false;
+        }
+        String configured = SecureStore.getBoxInputId(this);
+        String configuredLabel = SecureStore.getBoxInputLabel(this);
+
+        // Directly verify foreground app even if input metadata is still loading
+        if (foregroundApp != null && !foregroundApp.isEmpty()) {
+            if (configured != null && !configured.isEmpty() && (foregroundApp.equalsIgnoreCase(configured)
+                    || foregroundApp.toLowerCase(Locale.ROOT).contains(configured.toLowerCase(Locale.ROOT)))) {
+                return true;
+            }
+            if ("com.webos.app.hdmi3".equalsIgnoreCase(foregroundApp) || foregroundApp.toLowerCase(Locale.ROOT).contains("hdmi3")) {
+                return true;
+            }
+        }
+
         LgTvClient.TvInput active = getActiveInput();
         if (active == null) {
             return false;
         }
-        return Routing.isBoxInput(SecureStore.getBoxInputId(this), active.id, active.appId);
+        if (configured != null && !configured.isEmpty()) {
+            if (Routing.isBoxInput(configured, active.id, active.appId)) {
+                return true;
+            }
+            if (active.label != null && active.label.equalsIgnoreCase(configured)) {
+                return true;
+            }
+        }
+        if (configuredLabel != null && !configuredLabel.isEmpty() && active.label != null) {
+            if (active.label.equalsIgnoreCase(configuredLabel)) {
+                return true;
+            }
+        }
+        if ("com.webos.app.hdmi3".equalsIgnoreCase(active.appId)
+                || (active.id != null && active.id.equalsIgnoreCase("HDMI_3"))
+                || (active.label != null && active.label.equalsIgnoreCase("Den"))) {
+            SecureStore.setBoxInput(this, active.id, active.label);
+            return true;
+        }
+        return false;
+    }
+
+    public void onModeChanged() {
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            if (boxController != null) {
+                boxController.setActive(true);
+            }
+            if (boxMouse != null && !boxMouse.isConnected()) {
+                boxMouse.autoConnect();
+            }
+        } else if (mode == SecureStore.MODE_LG_TV) {
+            if (boxController != null) {
+                boxController.setActive(false);
+            }
+        } else {
+            boolean active = state == LgTvClient.State.READY && isBoxActive();
+            if (boxController != null) {
+                boxController.setActive(active);
+            }
+        }
+        updateNotification();
+        for (Listener listener : listeners) {
+            listener.onConnection(isConnected() ? LgTvClient.State.READY : LgTvClient.State.IDLE,
+                    isConnected() ? "Connected" : "Disconnected", displayName(), tvModel);
+        }
     }
 
     /** Stores which TV input belongs to the Android TV box. */
@@ -561,53 +679,57 @@ public final class RemoteService extends Service implements LgTvClient.Listener 
     }
 
     public void launchApp(String appId) {
-        client.launchApp(appId);
+        launchApp(appId, null);
+    }
+
+    public void launchApp(String appId, String contentId) {
+        if (client != null) client.launchApp(appId, contentId);
     }
 
     public void switchInput(String inputId) {
-        client.switchInput(inputId);
+        if (client != null) client.switchInput(inputId);
     }
 
     public void powerOff() {
         setTvPowerState("Power Off", true);
-        client.powerOff();
+        if (client != null) client.powerOff();
     }
 
     public void turnOnScreen() {
-        client.turnOnScreen();
+        if (client != null) client.turnOnScreen();
         setTvPowerState("Active", true);
     }
 
     public boolean sendButton(String name) {
-        return client.sendButton(name);
+        return client != null && client.sendButton(name);
     }
 
     public boolean sendClick() {
         if (isBoxActive()) {
-            return boxMouse != null && boxMouse.sendClick();
+            return boxMouse != null && boxMouse.isConnected() && boxMouse.sendClick();
         }
-        return client.sendClick();
+        return client != null && client.sendClick();
     }
 
     public boolean sendSecondaryClick() {
         if (isBoxActive()) {
-            return boxMouse != null && boxMouse.sendRightClick();
+            return boxMouse != null && boxMouse.isConnected() && boxMouse.sendRightClick();
         }
         return false;
     }
 
     public boolean sendMove(int dx, int dy, boolean down) {
         if (isBoxActive()) {
-            return boxMouse != null && boxMouse.sendMove(dx, dy, down);
+            return boxMouse != null && boxMouse.isConnected() && boxMouse.sendMove(dx, dy, down);
         }
-        return client.sendMove(dx, dy, down);
+        return client != null && client.sendMove(dx, dy, down);
     }
 
     public boolean sendScroll(int dx, int dy) {
         if (isBoxActive()) {
-            return boxMouse != null && boxMouse.sendScroll(dx, dy);
+            return boxMouse != null && boxMouse.isConnected() && boxMouse.sendScroll(dx, dy);
         }
-        return client.sendScroll(dx, dy);
+        return client != null && client.sendScroll(dx, dy);
     }
 
     public BoxBluetoothMouse getBoxMouse() {

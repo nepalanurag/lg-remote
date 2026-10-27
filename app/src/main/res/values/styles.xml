@@ -8,5 +8,13 @@
         <item name="android:colorAccent">@color/accent</item>
         <item name="android:fontFamily">sans-serif</item>
         <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:alertDialogTheme">@style/Theme.CleanRemote.Dialog</item>
+    </style>
+
+    <style name="Theme.CleanRemote.Dialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:background">@color/surface</item>
+        <item name="android:textColorPrimary">@color/text</item>
+        <item name="android:textColorSecondary">@color/muted</item>
     </style>
 </resources>

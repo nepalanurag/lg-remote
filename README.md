@@ -11,6 +11,16 @@ Everything operates strictly over your local Wi-Fi and Bluetooth: **no cloud, no
 
 ---
 
+<p align="center">
+  <img src="docs/shots/remote-dpad.png" alt="LG Remote - Tactile D-Pad Mode" width="310">&nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/shots/remote-trackpad.png" alt="LG Remote - Precision Trackpad Mode" width="310">
+</p>
+<p align="center">
+  <em>Tactile onn.-style D-Pad layout (left) &nbsp;·&nbsp; Full-width Precision Trackpad mode (right)</em>
+</p>
+
+---
+
 ## 📥 Quick Download
 
 Get the latest pre-compiled, optimized APK ready to install:
@@ -60,6 +70,21 @@ A custom-engineered relative touchpad state machine matching modern laptop track
 - **Continuous Scrubbing & Navigation**: Holding D-pad arrows, **Rewind**, or **Fast-Forward** continuously repeats commands at $120\,\text{ms}$ intervals for rapid grid navigation and media scrubbing.
 - **Hold-to-Back**: Holding **Back** smoothly navigates backward through nested UI levels at an ergonomic $180\,\text{ms}$ cadence.
 - **Trackpad Click & Hold**: Pressing and holding the on-screen **Click** button holds mouse button 1 down for native drag-and-drop and long-clicks.
+
+---
+
+### 🎙️ Voice Search & Hardware Mic Streaming
+- **Push-to-Talk Audio Streaming**: Hold the **Voice** button to record and stream audio directly to your Android TV box over TLS using the Google TV Remote Protocol v2 (`RemoteVoicePayload` protobuf stream, 16-bit PCM mono @ 8000 Hz).
+- **Universal Voice Dictation**: When on LG webOS or typing into on-screen search bars, tapping the mic triggers instant speech-to-text dictation that populates the TV search bar immediately.
+
+---
+
+### 🔀 Standalone & Unified Remote Modes
+- **Three Dedicated Operating Modes**:
+  - **Unified (Auto)**: Intelligently routes between LG webOS and Android TV based on active HDMI input.
+  - **Android TV Only**: Pure standalone remote for users who only have an Android TV box, Chromecast, or Google TV.
+  - **LG webOS Only**: Pure standalone remote for users who only have an LG TV.
+- **One-Tap Mode Switcher**: Tap the **Mode Badge** in the header or switch modes in **Settings** or the **Setup Screen** anytime.
 
 ---
 

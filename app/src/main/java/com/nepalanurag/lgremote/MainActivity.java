@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Dialog;
+import android.content.ActivityNotFoundException;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -13,12 +14,16 @@ import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.text.Editable;
 import android.text.InputFilter;
 import android.text.InputType;
@@ -27,6 +32,7 @@ import android.util.Log;
 import android.util.Patterns;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -40,6 +46,7 @@ import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.HorizontalScrollView;
 import android.widget.SeekBar;
 import android.widget.Space;
 import android.widget.Switch;
@@ -58,7 +65,8 @@ import java.util.List;
 import java.util.Locale;
 
 /** The whole phone UI: discovery and pairing, the button remote, trackpad and settings. */
-public final class MainActivity extends Activity implements RemoteService.Listener {
+public final class MainActivity extends Activity implements RemoteService.Listener, AndroidTvRemote.VoiceSessionListener {
+    private static final String TAG = "LgRemote";
     private static final int REQ_NOTIFICATIONS = 41;
     /**
      * A brief settle time for the keyboard, short enough that letters show up almost as they are
@@ -72,6 +80,8 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private final List<View> commandControls = new ArrayList<>();
     private final List<View> textControls = new ArrayList<>();
     private final List<View> appsTiles = new ArrayList<>();
+    private final List<TvDiscovery.Tv> lastDiscoveredTvs = new ArrayList<>();
+    private final List<AndroidTvRemote.DiscoveredBox> lastDiscoveredBoxes = new ArrayList<>();
 
     private RemoteService service;
     private boolean bound;
@@ -91,6 +101,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private TextView headerTitle;
     private TextView headerSubtitle;
     private TextView powerBadge;
+    private TextView modeBadge;
     private View statusDot;
     private LinearLayout banner;
     private TextView bannerText;
@@ -104,6 +115,9 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private TrackpadView trackpad;
     private TextView volumeLabel;
     private final List<ImageView> muteIcons = new ArrayList<>();
+    private CarouselView carousel;
+    private final List<View> carouselDots = new ArrayList<>();
+    private View tvKeyboardBar;
     private RemoteEditText tvTextField;
     private TextView tvKeyboardLabel;
     private TextView tvKeyboardHint;
@@ -115,6 +129,12 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private String sentText = "";
     private int textSession;
     private String foregroundApp = "";
+    private static final int REQUEST_RECORD_AUDIO = 4102;
+    private static final int REQUEST_SPEECH_DICTATION = 4103;
+    private final VoiceStreamer voiceStreamer = new VoiceStreamer();
+    private Drawable voiceOriginalBackground;
+    private SpeechRecognizer inAppRecognizer;
+    private boolean inAppRecognizing;
 
     private TvDiscovery discovery;
     private Dialog settingsDialog;
@@ -177,8 +197,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
 
-        String savedIp = SecureStore.getSavedIp(this);
-        if (savedIp == null) {
+        int mode = SecureStore.getDeviceMode(this);
+        boolean hasTv = SecureStore.getSavedIp(this) != null;
+        boolean hasBox = AndroidTvRemote.isPaired(this);
+        boolean ready = (mode == SecureStore.MODE_ANDROID_TV && hasBox)
+                || (mode == SecureStore.MODE_LG_TV && hasTv)
+                || (mode == SecureStore.MODE_AUTO && (hasTv || hasBox));
+        if (!ready) {
             showSetup(false);
         } else {
             headerTitle.setText(savedName());
@@ -190,9 +215,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     @Override
     protected void onStart() {
         super.onStart();
+        AndroidTvRemote.setVoiceSessionListener(this);
+        int mode = SecureStore.getDeviceMode(this);
         String saved = SecureStore.getSavedIp(this);
-        if (saved != null && !setupVisible && !manuallyDisconnected) {
-            RemoteService.start(this, null, null);
+        if (!setupVisible && !manuallyDisconnected) {
+            if (mode == SecureStore.MODE_ANDROID_TV && AndroidTvRemote.isPaired(this)) {
+                RemoteService.start(this, null, null);
+            } else if (saved != null) {
+                RemoteService.start(this, null, null);
+            }
         }
         if (!bound) {
             bindService(new Intent(this, RemoteService.class), connection, Context.BIND_AUTO_CREATE);
@@ -204,6 +235,9 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
     @Override
     protected void onStop() {
+        AndroidTvRemote.setVoiceSessionListener(null);
+        voiceStreamer.stop();
+        dismissVoiceActiveHud();
         if (bound) {
             if (service != null) {
                 service.removeListener(this);
@@ -230,6 +264,14 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         cancelBoxPairing();
         if (discovery != null) {
             discovery.stop();
+        }
+        voiceStreamer.stop();
+        if (inAppRecognizer != null) {
+            try {
+                inAppRecognizer.destroy();
+            } catch (Exception ignored) {
+            }
+            inAppRecognizer = null;
         }
         super.onDestroy();
     }
@@ -293,6 +335,75 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         subParams.topMargin = dp(12);
         content.addView(sub, subParams);
+
+        content.addView(Ui.label(this, getString(R.string.choose_remote_mode)));
+        LinearLayout modeRow = Ui.row(this);
+        LinearLayout.LayoutParams modeRowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(40));
+        modeRowParams.topMargin = dp(8);
+        content.addView(modeRow, modeRowParams);
+
+        int currentMode = SecureStore.getDeviceMode(this);
+        TextView optBoth = pill(getString(R.string.mode_unified), currentMode == SecureStore.MODE_AUTO);
+        TextView optBox = pill(getString(R.string.mode_android_tv), currentMode == SecureStore.MODE_ANDROID_TV);
+        TextView optLg = pill(getString(R.string.mode_lg_tv), currentMode == SecureStore.MODE_LG_TV);
+        modeRow.addView(optBoth, weighted(1f, 40, 0, 4));
+        modeRow.addView(optBox, weighted(1f, 40, 0, 4));
+        modeRow.addView(optLg, weighted(1f, 40, 0, 0));
+
+        if (currentMode == SecureStore.MODE_ANDROID_TV) {
+            title.setText(R.string.android_tv_setup_title);
+            sub.setText(R.string.android_tv_setup_sub);
+        }
+
+        Runnable updateSetupModeUi = () -> {
+            int m = SecureStore.getDeviceMode(this);
+            optBoth.setBackground(m == SecureStore.MODE_AUTO
+                    ? Ui.pressable(this, getColor(R.color.accent), 12)
+                    : Ui.pressable(this, getColor(R.color.surface_2), 12, getColor(R.color.stroke), 1));
+            optBoth.setTextColor(m == SecureStore.MODE_AUTO ? getColor(R.color.on_accent) : getColor(R.color.text));
+
+            optBox.setBackground(m == SecureStore.MODE_ANDROID_TV
+                    ? Ui.pressable(this, getColor(R.color.accent), 12)
+                    : Ui.pressable(this, getColor(R.color.surface_2), 12, getColor(R.color.stroke), 1));
+            optBox.setTextColor(m == SecureStore.MODE_ANDROID_TV ? getColor(R.color.on_accent) : getColor(R.color.text));
+
+            optLg.setBackground(m == SecureStore.MODE_LG_TV
+                    ? Ui.pressable(this, getColor(R.color.accent), 12)
+                    : Ui.pressable(this, getColor(R.color.surface_2), 12, getColor(R.color.stroke), 1));
+            optLg.setTextColor(m == SecureStore.MODE_LG_TV ? getColor(R.color.on_accent) : getColor(R.color.text));
+
+            if (m == SecureStore.MODE_ANDROID_TV) {
+                title.setText(R.string.android_tv_setup_title);
+                sub.setText(R.string.android_tv_setup_sub);
+                manualIp.setHint(R.string.box_ip_hint);
+            } else {
+                title.setText(R.string.setup_title);
+                sub.setText(R.string.setup_sub);
+                manualIp.setHint(R.string.tv_ip_hint);
+            }
+            if (discovery != null) {
+                discovery.stop();
+            }
+            discoveryStarted = false;
+            startDiscovery();
+        };
+
+        optBoth.setOnClickListener(v -> {
+            clickHaptic(v);
+            SecureStore.setDeviceMode(this, SecureStore.MODE_AUTO);
+            updateSetupModeUi.run();
+        });
+        optBox.setOnClickListener(v -> {
+            clickHaptic(v);
+            SecureStore.setDeviceMode(this, SecureStore.MODE_ANDROID_TV);
+            updateSetupModeUi.run();
+        });
+        optLg.setOnClickListener(v -> {
+            clickHaptic(v);
+            SecureStore.setDeviceMode(this, SecureStore.MODE_LG_TV);
+            updateSetupModeUi.run();
+        });
 
         LinearLayout card = Ui.column(this);
         card.setPadding(dp(18), dp(18), dp(18), dp(18));
@@ -416,34 +527,196 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
         hideKeyboard();
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            startBoxPairing(ip, false);
+            return;
+        }
         connectTo(ip, "");
     }
 
     private void startDiscovery() {
-        if (discovery == null || discovery.isRunning()) {
-            return;
-        }
+        int mode = SecureStore.getDeviceMode(this);
         discoveryStarted = true;
         setupStatus.setText(R.string.searching);
-        discoveryList.removeAllViews();
-        discovery.start(tvs -> {
-            if (isFinishing() || isDestroyed()) {
-                return;
+        lastDiscoveredTvs.clear();
+        lastDiscoveredBoxes.clear();
+        renderDiscovery();
+
+        if (mode == SecureStore.MODE_AUTO || mode == SecureStore.MODE_LG_TV) {
+            if (discovery != null) {
+                discovery.stop();
+                discovery.start(tvs -> {
+                    if (isFinishing() || isDestroyed()) {
+                        return;
+                    }
+                    lastDiscoveredTvs.clear();
+                    if (tvs != null) {
+                        lastDiscoveredTvs.addAll(tvs);
+                    }
+                    renderDiscovery();
+                });
             }
-            renderDiscovery(tvs);
-        });
+        }
+
+        if (mode == SecureStore.MODE_AUTO || mode == SecureStore.MODE_ANDROID_TV) {
+            AndroidTvRemote.discoverAll(this, boxes -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                lastDiscoveredBoxes.clear();
+                if (boxes != null) {
+                    lastDiscoveredBoxes.addAll(boxes);
+                }
+                renderDiscovery();
+            });
+        }
     }
 
-    private void renderDiscovery(List<TvDiscovery.Tv> tvs) {
+    private void renderDiscovery() {
         discoveryList.removeAllViews();
-        if (tvs.isEmpty()) {
-            setupStatus.setText(R.string.no_tvs_found);
-            return;
+        int mode = SecureStore.getDeviceMode(this);
+        int totalFound = 0;
+
+        if (mode == SecureStore.MODE_AUTO) {
+            totalFound = lastDiscoveredTvs.size() + lastDiscoveredBoxes.size();
+            if (totalFound == 0) {
+                setupStatus.setText(R.string.searching);
+                return;
+            }
+            setupStatus.setText(getString(R.string.tv_found, totalFound));
+
+            // 1. LG Smart TV section
+            TextView lgLabel = Ui.label(this, getString(R.string.mode_lg_tv).toUpperCase(Locale.US));
+            lgLabel.setPadding(0, dp(4), 0, dp(2));
+            discoveryList.addView(lgLabel);
+
+            if (lastDiscoveredTvs.isEmpty()) {
+                TextView waiting = Ui.text(this, "Searching for LG webOS TV...", 12, getColor(R.color.muted), Typeface.NORMAL);
+                waiting.setPadding(dp(4), dp(4), dp(4), dp(8));
+                discoveryList.addView(waiting);
+            } else {
+                for (TvDiscovery.Tv tv : lastDiscoveredTvs) {
+                    discoveryList.addView(tvRow(tv));
+                }
+            }
+
+            // 2. Android TV Box section
+            TextView boxLabel = Ui.label(this, getString(R.string.mode_android_tv).toUpperCase(Locale.US));
+            boxLabel.setPadding(0, dp(14), 0, dp(2));
+            discoveryList.addView(boxLabel);
+
+            if (lastDiscoveredBoxes.isEmpty()) {
+                TextView waiting = Ui.text(this, "Searching for Android TV box...", 12, getColor(R.color.muted), Typeface.NORMAL);
+                waiting.setPadding(dp(4), dp(4), dp(4), dp(8));
+                discoveryList.addView(waiting);
+            } else {
+                List<AndroidTvRemote.DiscoveredBox> sorted = new ArrayList<>(lastDiscoveredBoxes);
+                sorted.sort((a, b) -> {
+                    boolean aMatch = getMatchingTvInputLabel(a) != null;
+                    boolean bMatch = getMatchingTvInputLabel(b) != null;
+                    if (aMatch != bMatch) return aMatch ? -1 : 1;
+                    boolean aPaired = SecureStore.isBoxPaired(this) && a.host.equals(SecureStore.getBoxHost(this));
+                    boolean bPaired = SecureStore.isBoxPaired(this) && b.host.equals(SecureStore.getBoxHost(this));
+                    if (aPaired != bPaired) return aPaired ? -1 : 1;
+                    return (a.name != null ? a.name : "").compareToIgnoreCase(b.name != null ? b.name : "");
+                });
+                for (AndroidTvRemote.DiscoveredBox box : sorted) {
+                    discoveryList.addView(boxRow(box));
+                }
+            }
+        } else if (mode == SecureStore.MODE_LG_TV) {
+            totalFound = lastDiscoveredTvs.size();
+            if (totalFound == 0) {
+                setupStatus.setText(R.string.no_tvs_found);
+                return;
+            }
+            setupStatus.setText(getString(R.string.tv_found, totalFound));
+            for (TvDiscovery.Tv tv : lastDiscoveredTvs) {
+                discoveryList.addView(tvRow(tv));
+            }
+        } else if (mode == SecureStore.MODE_ANDROID_TV) {
+            totalFound = lastDiscoveredBoxes.size();
+            if (totalFound == 0) {
+                setupStatus.setText(R.string.box_not_found);
+                return;
+            }
+            setupStatus.setText(getString(R.string.tv_found, totalFound));
+            for (AndroidTvRemote.DiscoveredBox box : lastDiscoveredBoxes) {
+                discoveryList.addView(boxRow(box));
+            }
         }
-        setupStatus.setText(getString(R.string.tv_found, tvs.size()));
-        for (TvDiscovery.Tv tv : tvs) {
-            discoveryList.addView(tvRow(tv));
+    }
+
+    private String getMatchingTvInputLabel(AndroidTvRemote.DiscoveredBox box) {
+        if (box == null || box.name == null) return null;
+        String normBox = box.name.trim().toLowerCase(Locale.ROOT);
+        List<LgTvClient.TvInput> inputs = service != null ? service.getInputs() : null;
+        if (inputs != null) {
+            for (LgTvClient.TvInput in : inputs) {
+                if (in == null || in.label == null) continue;
+                String normInput = in.label.trim().toLowerCase(Locale.ROOT);
+                if (normInput.isEmpty() || normInput.startsWith("hdmi") || normInput.equals("av") || normInput.equals("component")) {
+                    continue;
+                }
+                if (normBox.equals(normInput) || normBox.contains(normInput) || normInput.contains(normBox)) {
+                    return in.label;
+                }
+            }
         }
+        String savedLabel = SecureStore.getBoxInputLabel(this);
+        if (savedLabel != null && !savedLabel.isEmpty()) {
+            String normSaved = savedLabel.trim().toLowerCase(Locale.ROOT);
+            if (normBox.equals(normSaved) || normBox.contains(normSaved) || normSaved.contains(normBox)) {
+                return savedLabel;
+            }
+        }
+        return null;
+    }
+
+    private AndroidTvRemote.DiscoveredBox findBoxMatchingTvInput(List<AndroidTvRemote.DiscoveredBox> boxes) {
+        if (boxes == null || boxes.isEmpty()) {
+            return null;
+        }
+        String savedHost = SecureStore.getBoxHost(this);
+        if (savedHost != null && !savedHost.isEmpty()) {
+            for (AndroidTvRemote.DiscoveredBox box : boxes) {
+                if (box != null && savedHost.equals(box.host)) {
+                    return box;
+                }
+            }
+        }
+        List<LgTvClient.TvInput> inputs = service != null ? service.getInputs() : null;
+        if (inputs == null || inputs.isEmpty()) {
+            String savedLabel = SecureStore.getBoxInputLabel(this);
+            if (savedLabel != null && !savedLabel.isEmpty()) {
+                for (AndroidTvRemote.DiscoveredBox box : boxes) {
+                    if (box.name != null && box.name.equalsIgnoreCase(savedLabel.trim())) {
+                        return box;
+                    }
+                }
+            }
+            return null;
+        }
+
+        for (LgTvClient.TvInput in : inputs) {
+            if (in == null || in.label == null) continue;
+            String normInput = in.label.trim().toLowerCase(Locale.ROOT);
+            if (normInput.isEmpty() || normInput.startsWith("hdmi") || normInput.equals("av") || normInput.equals("component")) {
+                continue;
+            }
+            for (AndroidTvRemote.DiscoveredBox box : boxes) {
+                if (box == null || box.name == null) continue;
+                String normBox = box.name.trim().toLowerCase(Locale.ROOT);
+                if (normBox.equals(normInput) || normBox.contains(normInput) || normInput.contains(normBox)) {
+                    if (in.id != null) {
+                        SecureStore.setBoxInput(this, in.id, in.label);
+                    }
+                    return box;
+                }
+            }
+        }
+        return null;
     }
 
     private View tvRow(TvDiscovery.Tv tv) {
@@ -478,10 +751,106 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         subParams.topMargin = dp(3);
         text.addView(subView, subParams);
 
-        row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 18));
+        boolean isSavedTv = tv.ip.equals(SecureStore.getSavedIp(this));
+        if (isSavedTv) {
+            TextView badgePaired = Ui.text(this, "SAVED", 10, getColor(R.color.accent), Typeface.BOLD);
+            badgePaired.setBackground(Ui.round(this, getColor(R.color.accent_dim), 8));
+            badgePaired.setPadding(dp(8), dp(4), dp(8), dp(4));
+            row.addView(badgePaired);
+        } else {
+            row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 18));
+        }
+
         row.setOnClickListener(v -> {
             clickHaptic(v);
-            connectTo(tv.ip, tv.name);
+            int mode = SecureStore.getDeviceMode(this);
+            if (mode == SecureStore.MODE_ANDROID_TV) {
+                startBoxPairing(tv.ip, false);
+            } else {
+                connectTo(tv.ip, tv.name);
+            }
+        });
+        return row;
+    }
+
+    private View boxRow(AndroidTvRemote.DiscoveredBox box) {
+        LinearLayout row = Ui.row(this);
+        row.setPadding(dp(10), dp(10), dp(10), dp(10));
+        row.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 16,
+                getColor(R.color.stroke), 1));
+        row.setClickable(true);
+        row.setFocusable(true);
+        row.setContentDescription(box.name + ", " + box.host);
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rowParams.topMargin = dp(8);
+        row.setLayoutParams(rowParams);
+
+        FrameLayout badge = new FrameLayout(this);
+        badge.setBackground(Ui.round(this, getColor(R.color.accent_dim), 12));
+        ImageView icon = Ui.icon(this, R.drawable.ic_home, getColor(R.color.accent), 20);
+        badge.addView(icon, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
+        row.addView(badge, Ui.dpParams(this, 40, 40));
+
+        LinearLayout text = Ui.column(this);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        textParams.leftMargin = dp(11);
+        row.addView(text, textParams);
+        text.addView(Ui.text(this, box.name != null ? box.name : "Android TV", 14, getColor(R.color.text), Typeface.BOLD));
+
+        boolean isPaired = SecureStore.isBoxPaired(this) && box.host.equals(SecureStore.getBoxHost(this));
+        String matchedInput = getMatchingTvInputLabel(box);
+        String sub = box.host;
+        if (matchedInput != null) {
+            sub += "  ·  TV Input: " + matchedInput;
+        } else if (isPaired) {
+            sub += "  ·  Paired";
+        } else {
+            sub += "  ·  Tap to pair";
+        }
+        TextView subView = Ui.text(this, sub, 11, getColor(R.color.muted), Typeface.NORMAL);
+        LinearLayout.LayoutParams subParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        subParams.topMargin = dp(3);
+        text.addView(subView, subParams);
+
+        if (matchedInput != null) {
+            TextView badgeTvInput = Ui.text(this, "TV INPUT", 10, getColor(R.color.accent), Typeface.BOLD);
+            badgeTvInput.setBackground(Ui.round(this, getColor(R.color.accent_dim), 8));
+            badgeTvInput.setPadding(dp(8), dp(4), dp(8), dp(4));
+            row.addView(badgeTvInput);
+        } else if (isPaired) {
+            TextView badgePaired = Ui.text(this, "PAIRED", 10, getColor(R.color.accent), Typeface.BOLD);
+            badgePaired.setBackground(Ui.round(this, getColor(R.color.accent_dim), 8));
+            badgePaired.setPadding(dp(8), dp(4), dp(8), dp(4));
+            row.addView(badgePaired);
+        } else {
+            row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 18));
+        }
+
+        row.setOnClickListener(v -> {
+            clickHaptic(v);
+            int mode = SecureStore.getDeviceMode(this);
+            if (isPaired) {
+                SecureStore.setBoxHost(this, box.host);
+                if (box.name != null) SecureStore.setBoxName(this, box.name);
+                if (mode == SecureStore.MODE_ANDROID_TV) {
+                    RemoteService.start(this, null, null);
+                    showRemote();
+                } else {
+                    toast(getString(R.string.box_paired) + " (" + box.host + ")");
+                    if (service != null) service.updateActiveControllers();
+                    renderDiscovery();
+                }
+            } else {
+                startBoxPairing(box.host, false);
+            }
+        });
+        row.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            startBoxPairing(box.host, false);
+            return true;
         });
         return row;
     }
@@ -500,67 +869,641 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     // ------------------------------------------------------------------ remote screen
 
     private View buildRemote() {
-        boolean landscape = isLandscape();
+        if (isLandscape()) {
+            return buildLandscapeRemote();
+        }
+        return buildPortraitRemote();
+    }
+
+    private ImageButton cornerToggleBtn;
+    private FrameLayout rightDeckContainer;
+    private ImageButton powerBtn;
+
+    private View buildPortraitRemote() {
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.setClipToPadding(false);
         scroll.setVerticalScrollBarEnabled(false);
         LinearLayout content = Ui.column(this);
-        content.setPadding(landscape ? dp(14) : dp(20), landscape ? dp(4) : dp(10),
-                landscape ? dp(14) : dp(20), landscape ? dp(6) : dp(30));
+        content.setPadding(dp(16), dp(10), dp(16), dp(10));
         scroll.addView(content, new ScrollView.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        // 1. Header: [App Settings Tuner] --- [Device / Input Pill ▾] --- [Dynamic Power Button]
         LinearLayout header = Ui.row(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        int headerBtnSize = dp(42);
+
+        // Left: App & Connection Settings (tuner icon)
+        ImageButton appSettings = new ImageButton(this);
+        appSettings.setImageResource(R.drawable.ic_tv_settings);
+        appSettings.setColorFilter(getColor(R.color.text));
+        appSettings.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        appSettings.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        appSettings.setContentDescription(getString(R.string.settings));
+        appSettings.setOnClickListener(v -> {
+            clickHaptic(v);
+            showSettings();
+        });
+        header.addView(appSettings, new LinearLayout.LayoutParams(headerBtnSize, headerBtnSize));
+
+        Space leftSpace = new Space(this);
+        header.addView(leftSpace, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // Center: Device / Input selector dropdown pill
+        LinearLayout devicePill = Ui.row(this);
+        devicePill.setGravity(Gravity.CENTER);
+        devicePill.setPadding(dp(14), dp(8), dp(14), dp(8));
+        devicePill.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 24, getColor(R.color.stroke), 1));
+        devicePill.setOnClickListener(v -> {
+            clickHaptic(v);
+            showInputs();
+        });
+        devicePill.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            showDeviceModeDialog();
+            return true;
+        });
+
         statusDot = new View(this);
         statusDot.setBackground(Ui.round(this, getColor(R.color.amber), 99));
-        LinearLayout.LayoutParams dotParams = Ui.dpParams(this, 9, 9);
-        dotParams.rightMargin = dp(10);
-        header.addView(statusDot, dotParams);
+        LinearLayout.LayoutParams dotParams = Ui.dpParams(this, 7, 7);
+        dotParams.rightMargin = dp(6);
+        devicePill.addView(statusDot, dotParams);
 
-        LinearLayout headerText = Ui.column(this);
-        header.addView(headerText, new LinearLayout.LayoutParams(0,
+        ImageView inputIcon = Ui.icon(this, R.drawable.ic_input, getColor(R.color.text), 15);
+        LinearLayout.LayoutParams inputIconParams = new LinearLayout.LayoutParams(dp(15), dp(15));
+        inputIconParams.rightMargin = dp(6);
+        devicePill.addView(inputIcon, inputIconParams);
+
+        headerTitle = Ui.text(this, savedName(), 13.5f, getColor(R.color.text), Typeface.BOLD);
+        headerTitle.setSingleLine(true);
+        headerTitle.setMaxWidth(dp(125));
+        headerTitle.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        devicePill.addView(headerTitle);
+
+        ImageView chevron = Ui.icon(this, R.drawable.ic_chevron_down, getColor(R.color.muted), 14);
+        LinearLayout.LayoutParams chevronParams = new LinearLayout.LayoutParams(dp(14), dp(14));
+        chevronParams.leftMargin = dp(5);
+        devicePill.addView(chevron, chevronParams);
+
+        header.addView(devicePill);
+
+        Space rightSpace = new Space(this);
+        header.addView(rightSpace, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // Right: Power button (green = on, orange = standby, red = off)
+        powerBtn = new ImageButton(this);
+        powerBtn.setImageResource(R.drawable.ic_power);
+        powerBtn.setColorFilter(Color.WHITE);
+        powerBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        powerBtn.setBackground(Ui.circle(this, getColor(R.color.danger), getColor(R.color.danger)));
+        powerBtn.setContentDescription(getString(R.string.power));
+        powerBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            powerPressed();
+        });
+        powerBtn.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            wakeBoxCec(true);
+            return true;
+        });
+        header.addView(powerBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        updatePowerButton();
+
+        content.addView(header);
+
+        // Hidden aux views for renderConnection() compatibility
+        headerSubtitle = Ui.text(this, "", 0, 0, Typeface.NORMAL);
+        headerSubtitle.setVisibility(View.GONE);
+        content.addView(headerSubtitle);
+
+        modeBadge = Ui.text(this, "", 0, 0, Typeface.NORMAL);
+        modeBadge.setVisibility(View.GONE);
+        content.addView(modeBadge);
+
+        powerBadge = Ui.text(this, "", 0, 0, Typeface.NORMAL);
+        powerBadge.setVisibility(View.GONE);
+        content.addView(powerBadge);
+
+        banner = Ui.row(this);
+        banner.setPadding(dp(13), dp(11), dp(8), dp(11));
+        banner.setBackground(Ui.round(this, getColor(R.color.surface_2), 14,
+                getColor(R.color.accent_dim), 1));
+        bannerText = Ui.text(this, "", 12, getColor(R.color.text), Typeface.NORMAL);
+        bannerText.setLineSpacing(0f, 1.25f);
+        banner.addView(bannerText, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        headerTitle = Ui.text(this, savedName(), landscape ? 16 : 18,
-                getColor(R.color.text), Typeface.BOLD);
-        if (BuildConfig.DEBUG) {
-            headerTitle.setOnLongClickListener(v -> {
+        bannerAction = Ui.text(this, "", 11, getColor(R.color.accent), Typeface.BOLD);
+        bannerAction.setPadding(dp(10), dp(6), dp(6), dp(6));
+        banner.addView(bannerAction);
+        banner.setVisibility(View.GONE);
+        LinearLayout.LayoutParams bannerParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bannerParams.topMargin = dp(6);
+        content.addView(banner, bannerParams);
+
+        // 2. TV Text Keyboard Bar with Voice Mic (MOVED TO TOP UNDER HEADER)
+        content.addView(buildTvKeyboardBar());
+
+        // Flexible top spacer (flex 0.12f)
+        Space topSpacer = new Space(this);
+        content.addView(topSpacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.12f));
+
+        // 3. Top Row above D-pad: [Apps on Left] --- [123 Numbers in Middle] --- [Device Settings on Right]
+        // (Like Onn remote top 3 buttons: profile, mic, settings)
+        int navBtnSize = dp(56);
+        LinearLayout topNavRow = Ui.row(this);
+        topNavRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams topNavParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, navBtnSize);
+        content.addView(topNavRow, topNavParams);
+
+        // Top-Left: Apps List
+        FrameLayout appsBtn = new FrameLayout(this);
+        appsBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        ImageView appsIcon = Ui.icon(this, R.drawable.ic_apps, getColor(R.color.text), 26);
+        appsBtn.addView(appsIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        appsBtn.setContentDescription(getString(R.string.apps));
+        appsBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            showApps();
+        });
+        topNavRow.addView(appsBtn, new LinearLayout.LayoutParams(navBtnSize, navBtnSize));
+
+        Space topNavSpace1 = new Space(this);
+        topNavRow.addView(topNavSpace1, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // Top-Middle: 123 Numbers & Color Keys
+        FrameLayout numpadBtn = new FrameLayout(this);
+        numpadBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        LinearLayout numpadInner = Ui.column(this);
+        numpadInner.setGravity(Gravity.CENTER);
+        TextView numText = Ui.text(this, "123", 13f, getColor(R.color.text), Typeface.BOLD);
+        numpadInner.addView(numText);
+        LinearLayout colorDots = Ui.row(this);
+        colorDots.setGravity(Gravity.CENTER);
+        colorDots.setPadding(0, dp(1), 0, 0);
+        int[] colors = {0xFFF44336, 0xFF4CAF50, 0xFFFFEB3B, 0xFF2196F3};
+        for (int c : colors) {
+            View dot = new View(this);
+            dot.setBackground(Ui.round(this, c, 99));
+            LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(dp(4), dp(4));
+            dp.setMargins(dp(1), 0, dp(1), 0);
+            colorDots.addView(dot, dp);
+        }
+        numpadInner.addView(colorDots);
+        numpadBtn.addView(numpadInner, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        numpadBtn.setContentDescription("123 and Color Keys");
+        numpadBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            showNumberPadDialog();
+        });
+        topNavRow.addView(numpadBtn, new LinearLayout.LayoutParams(navBtnSize, navBtnSize));
+
+        Space topNavSpace2 = new Space(this);
+        topNavRow.addView(topNavSpace2, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // Top-Right: Device Settings (gear icon)
+        FrameLayout devSettingsBtn = new FrameLayout(this);
+        devSettingsBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        ImageView devSettingsIcon = Ui.icon(this, R.drawable.ic_gear, getColor(R.color.text), 26);
+        devSettingsBtn.addView(devSettingsIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        devSettingsBtn.setContentDescription("Device Settings");
+        devSettingsBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            deviceSettingsPressed();
+        });
+        topNavRow.addView(devSettingsBtn, new LinearLayout.LayoutParams(navBtnSize, navBtnSize));
+
+        // Flexible spacer between Top Row and D-Pad
+        Space stageSpacer1 = new Space(this);
+        content.addView(stageSpacer1, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.12f));
+
+        // 4. Center Stage: Wide Rectangular Trackpad / Centered D-Pad
+        int stageHeight = dp(250);
+        FrameLayout stage = new FrameLayout(this);
+        LinearLayout.LayoutParams stageParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, stageHeight);
+        stageParams.topMargin = dp(2);
+        stageParams.bottomMargin = dp(2);
+        content.addView(stage, stageParams);
+
+        // Circular D-Pad in center
+        dpad = new DpadView(this);
+        dpad.setHaptics(haptics);
+        dpad.setListener(new DpadView.Listener() {
+            @Override
+            public void onButton(String name) {
+                sendButton(name);
+            }
+
+            @Override
+            public void onButtonLongPress(String name) {
+                sendButtonLong(name);
+            }
+        });
+        FrameLayout.LayoutParams dpadParams = new FrameLayout.LayoutParams(stageHeight, stageHeight, Gravity.CENTER);
+        stage.addView(dpad, dpadParams);
+        keyControls.add(dpad);
+
+        // Wide Rectangular Trackpad
+        trackpad = new TrackpadView(this);
+        trackpad.setPointerSpeed(SecureStore.getPointerSpeed(this));
+        trackpad.setHaptics(haptics);
+        trackpad.setListener(new TrackpadView.Listener() {
+            @Override
+            public void onMove(int dx, int dy, boolean buttonDown) {
                 if (service != null) {
-                    service.requestScreenshot((uri, error) ->
-                            Log.d("LgRemote", "TV screenshot: " + uri + " error=" + error));
+                    service.sendMove(dx, dy, buttonDown);
                 }
-                return true;
+            }
+
+            @Override
+            public void onClick() {
+                pointerClickPressed();
+            }
+
+            @Override
+            public void onScroll(int dx, int dy) {
+                if (service != null) {
+                    service.sendScroll(dx, dy);
+                }
+            }
+
+            @Override
+            public void onSecondaryClick() {
+                if (service != null) {
+                    service.sendSecondaryClick();
+                }
+            }
+        });
+        trackpad.setVisibility(View.GONE);
+        stage.addView(trackpad, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        keyControls.add(trackpad);
+
+        // Flexible spacer between D-Pad and Bottom Row
+        Space stageSpacer2 = new Space(this);
+        content.addView(stageSpacer2, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.12f));
+
+        // 5. Row below D-pad: [Back on Left] --- [Home in Middle] --- [Toggle on Right]
+        // (Like Onn remote row: Back arrow, Home button, Live TV/Toggle)
+        LinearLayout midNavRow = Ui.row(this);
+        midNavRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams midNavParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, navBtnSize);
+        content.addView(midNavRow, midNavParams);
+
+        // Bottom-Left: Back Button
+        FrameLayout backBtn = new FrameLayout(this);
+        backBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        ImageView backIcon = Ui.icon(this, R.drawable.ic_back, getColor(R.color.text), 26);
+        backBtn.addView(backIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        backBtn.setContentDescription(getString(R.string.back));
+        attachRepeat(backBtn, () -> sendButton("BACK"), 400, 180);
+        midNavRow.addView(backBtn, new LinearLayout.LayoutParams(navBtnSize, navBtnSize));
+        keyControls.add(backBtn);
+
+        Space midNavSpace1 = new Space(this);
+        midNavRow.addView(midNavSpace1, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // Bottom-Middle: Home Button
+        FrameLayout homeBtn = new FrameLayout(this);
+        homeBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        ImageView homeIcon = Ui.icon(this, R.drawable.ic_home, getColor(R.color.text), 26);
+        homeBtn.addView(homeIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        homeBtn.setContentDescription(getString(R.string.home));
+        homeBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            homePressed();
+        });
+        homeBtn.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            lgHomePressed();
+            return true;
+        });
+        midNavRow.addView(homeBtn, new LinearLayout.LayoutParams(navBtnSize, navBtnSize));
+        keyControls.add(homeBtn);
+
+        Space midNavSpace2 = new Space(this);
+        midNavRow.addView(midNavSpace2, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // Bottom-Right: Trackpad / D-Pad Toggle Button
+        cornerToggleBtn = new ImageButton(this);
+        cornerToggleBtn.setImageResource(R.drawable.ic_pointer);
+        cornerToggleBtn.setColorFilter(getColor(R.color.accent));
+        cornerToggleBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        cornerToggleBtn.setPadding(dp(15), dp(15), dp(15), dp(15));
+        cornerToggleBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        cornerToggleBtn.setContentDescription(getString(R.string.trackpad));
+        cornerToggleBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            showMode(!buttonsMode);
+        });
+        midNavRow.addView(cornerToggleBtn, new LinearLayout.LayoutParams(navBtnSize, navBtnSize));
+
+        // Flexible spacer before Rockers deck
+        Space deckSpacer = new Space(this);
+        content.addView(deckSpacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.15f));
+
+        // 6. Bottom Rockers Deck: [Volume Rocker (+/VOL/-)] --- [Mute Button] --- [Channel/Media Rocker]
+        // (Like Onn remote bottom: Volume pill on left, Mute circular button in center, Channel pill on right)
+        LinearLayout volChannelDeck = buildLowerDeck();
+        content.addView(volChannelDeck, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // Bottom spacer
+        Space bottomSpacer = new Space(this);
+        content.addView(bottomSpacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.1f));
+
+        return scroll;
+    }
+
+    private LinearLayout buildLowerDeck() {
+        LinearLayout row = Ui.row(this);
+        row.setGravity(Gravity.CENTER);
+        row.setPadding(dp(4), 0, dp(4), 0);
+
+        int rockerWidth = dp(82);
+        int deckHeight = dp(168);
+
+        // 1. Left: Volume Rocker (+ / VOL / −) - 82dp width, 168dp height
+        LinearLayout volRocker = Ui.column(this);
+        volRocker.setGravity(Gravity.CENTER);
+        volRocker.setBackground(Ui.round(this, getColor(R.color.surface_2), 38, getColor(R.color.stroke), 1));
+
+        FrameLayout volUpBtn = new FrameLayout(this);
+        volUpBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 38));
+        ImageView volUpIcon = Ui.icon(this, R.drawable.ic_vol_up, getColor(R.color.text), 26);
+        volUpBtn.addView(volUpIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        attachRepeat(volUpBtn, () -> sendButton("VOLUMEUP"));
+        volRocker.addView(volUpBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        volumeLabel = Ui.text(this, "VOL", 13f, getColor(R.color.muted), Typeface.BOLD);
+        volumeLabel.setGravity(Gravity.CENTER);
+        volRocker.addView(volumeLabel, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(30)));
+
+        FrameLayout volDownBtn = new FrameLayout(this);
+        volDownBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 38));
+        ImageView volDownIcon = Ui.icon(this, R.drawable.ic_vol_down, getColor(R.color.text), 26);
+        volDownBtn.addView(volDownIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        attachRepeat(volDownBtn, () -> sendButton("VOLUMEDOWN"));
+        volRocker.addView(volDownBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        row.addView(volRocker, new LinearLayout.LayoutParams(rockerWidth, deckHeight));
+
+        // Space between Left Rocker and Mute Button
+        Space leftMidSpace = new Space(this);
+        row.addView(leftMidSpace, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // 2. Middle: Mute Button (Circular button between volume and channel rockers)
+        int muteBtnSize = dp(60);
+        ImageButton muteBtn = new ImageButton(this);
+        muteBtn.setImageResource(R.drawable.ic_mute);
+        muteBtn.setColorFilter(getColor(R.color.text));
+        muteBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        muteBtn.setPadding(dp(17), dp(17), dp(17), dp(17));
+        muteBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        muteBtn.setContentDescription(getString(R.string.mute));
+        muteBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            sendButton("MUTE");
+        });
+        muteIcons.add(muteBtn);
+        keyControls.add(muteBtn);
+        row.addView(muteBtn, new LinearLayout.LayoutParams(muteBtnSize, muteBtnSize));
+
+        // Space between Mute Button and Right Rocker
+        Space rightMidSpace = new Space(this);
+        row.addView(rightMidSpace, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // 3. Right: Contextual Channel or Media Rocker - 82dp width, 168dp height
+        rightDeckContainer = new FrameLayout(this);
+        row.addView(rightDeckContainer, new LinearLayout.LayoutParams(rockerWidth, deckHeight));
+        updateRightDeckRocker();
+
+        return row;
+    }
+
+    private void updateRightDeckRocker() {
+        if (rightDeckContainer == null) return;
+        rightDeckContainer.removeAllViews();
+        boolean isLiveTv = isLiveTvActive();
+
+        LinearLayout rocker = Ui.column(this);
+        rocker.setGravity(Gravity.CENTER);
+        rocker.setBackground(Ui.round(this, getColor(R.color.surface_2), 38, getColor(R.color.stroke), 1));
+
+        if (isLiveTv) {
+            // Channel Rocker: [▲] / [CH] / [▼]
+            FrameLayout chUpBtn = new FrameLayout(this);
+            chUpBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 38));
+            ImageView chUpIcon = Ui.icon(this, R.drawable.ic_chevron_up, getColor(R.color.text), 26);
+            chUpBtn.addView(chUpIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            attachRepeat(chUpBtn, () -> sendButton("CHANNELUP"));
+            rocker.addView(chUpBtn, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+            TextView chLabel = Ui.text(this, "CH", 13f, getColor(R.color.muted), Typeface.BOLD);
+            chLabel.setGravity(Gravity.CENTER);
+            chLabel.setOnClickListener(v -> {
+                clickHaptic(v);
+                sendButton("GUIDE");
             });
-        }
-        headerText.addView(headerTitle);
-        headerSubtitle = Ui.text(this, getString(R.string.connecting), landscape ? 11 : 12,
-                getColor(R.color.muted), Typeface.NORMAL);
-        LinearLayout.LayoutParams headerSubParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        headerSubParams.topMargin = dp(3);
-        headerText.addView(headerSubtitle, headerSubParams);
+            rocker.addView(chLabel, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(30)));
 
-        powerBadge = Ui.text(this, "…", 9, getColor(R.color.muted), Typeface.BOLD);
-        powerBadge.setAllCaps(true);
-        powerBadge.setLetterSpacing(0.08f);
-        powerBadge.setGravity(Gravity.CENTER);
-        powerBadge.setPadding(dp(8), dp(5), dp(8), dp(5));
-        powerBadge.setContentDescription(getString(R.string.tv_power_status));
-        LinearLayout.LayoutParams badgeParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        badgeParams.rightMargin = dp(7);
-        header.addView(powerBadge, badgeParams);
+            FrameLayout chDownBtn = new FrameLayout(this);
+            chDownBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 38));
+            ImageView chDownIcon = Ui.icon(this, R.drawable.ic_chevron_down, getColor(R.color.text), 26);
+            chDownBtn.addView(chDownIcon, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            attachRepeat(chDownBtn, () -> sendButton("CHANNELDOWN"));
+            rocker.addView(chDownBtn, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        } else {
+            // Media Transport Rocker: [►►] / [▶||] / [◄◄]
+            FrameLayout fwdBtn = new FrameLayout(this);
+            fwdBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 38));
+            ImageView fwdIcon = Ui.icon(this, R.drawable.ic_forward, getColor(R.color.text), 24);
+            fwdBtn.addView(fwdIcon, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            attachRepeat(fwdBtn, () -> sendButton("FASTFORWARD"));
+            rocker.addView(fwdBtn, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        ImageButton gear = iconButton(R.drawable.ic_gear, this::showSettings, getString(R.string.settings));
-        header.addView(gear);
-        if (landscape) {
-            ImageButton tvSettings = iconButton(R.drawable.ic_tv_settings,
-                    this::deviceSettingsPressed, getString(R.string.device_settings));
-            LinearLayout.LayoutParams tvSettingsParams =
-                    new LinearLayout.LayoutParams(dp(42), dp(42));
-            tvSettingsParams.rightMargin = dp(8);
-            header.addView(tvSettings, tvSettingsParams);
+            FrameLayout playBtn = new FrameLayout(this);
+            playBtn.setBackground(Ui.pressable(this, getColor(R.color.secondary_container), 18));
+            ImageView playIcon = Ui.icon(this, R.drawable.ic_play_pause, getColor(R.color.accent), 26);
+            playBtn.addView(playIcon, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            playBtn.setOnClickListener(v -> {
+                clickHaptic(v);
+                sendButton("PLAY");
+            });
+            LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(
+                    dp(58), dp(44));
+            playParams.gravity = Gravity.CENTER_HORIZONTAL;
+            rocker.addView(playBtn, playParams);
+
+            FrameLayout rwdBtn = new FrameLayout(this);
+            rwdBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 38));
+            ImageView rwdIcon = Ui.icon(this, R.drawable.ic_rewind, getColor(R.color.text), 24);
+            rwdBtn.addView(rwdIcon, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            attachRepeat(rwdBtn, () -> sendButton("REWIND"));
+            rocker.addView(rwdBtn, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         }
+
+        rightDeckContainer.addView(rocker, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+    }
+
+    private View buildLandscapeRemote() {
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setClipToPadding(false);
+        scroll.setVerticalScrollBarEnabled(false);
+        LinearLayout content = Ui.column(this);
+        content.setPadding(dp(14), dp(4), dp(14), dp(6));
+        scroll.addView(content, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        LinearLayout header = Ui.row(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        int circleBtnSize = dp(36);
+
+        ImageButton gear = new ImageButton(this);
+        gear.setImageResource(R.drawable.ic_gear);
+        gear.setColorFilter(getColor(R.color.text));
+        gear.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        gear.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        gear.setContentDescription(getString(R.string.settings));
+        gear.setOnClickListener(v -> {
+            clickHaptic(v);
+            showSettings();
+        });
+        header.addView(gear, new LinearLayout.LayoutParams(circleBtnSize, circleBtnSize));
+
+        Space leftSpace = new Space(this);
+        header.addView(leftSpace, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        LinearLayout devicePill = Ui.row(this);
+        devicePill.setGravity(Gravity.CENTER);
+        devicePill.setPadding(dp(10), dp(6), dp(10), dp(6));
+        devicePill.setBackground(Ui.pressable(this, getColor(R.color.green), 24));
+        devicePill.setOnClickListener(v -> {
+            clickHaptic(v);
+            showDeviceModeDialog();
+        });
+        devicePill.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            showInputs();
+            return true;
+        });
+
+        statusDot = new View(this);
+        statusDot.setBackground(Ui.round(this, getColor(R.color.amber), 99));
+        LinearLayout.LayoutParams dotParams = Ui.dpParams(this, 7, 7);
+        dotParams.rightMargin = dp(4);
+        devicePill.addView(statusDot, dotParams);
+
+        ImageView tvIcon = Ui.icon(this, R.drawable.ic_tv, getColor(R.color.on_accent), 16);
+        LinearLayout.LayoutParams tvIconParams = new LinearLayout.LayoutParams(dp(16), dp(16));
+        tvIconParams.rightMargin = dp(5);
+        devicePill.addView(tvIcon, tvIconParams);
+
+        headerTitle = Ui.text(this, savedName(), 13, getColor(R.color.on_accent), Typeface.BOLD);
+        headerTitle.setSingleLine(true);
+        headerTitle.setMaxWidth(dp(105));
+        headerTitle.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        devicePill.addView(headerTitle);
+
+        ImageView chevron = Ui.icon(this, R.drawable.ic_chevron_down, getColor(R.color.on_accent), 14);
+        LinearLayout.LayoutParams chevronParams = new LinearLayout.LayoutParams(dp(14), dp(14));
+        chevronParams.leftMargin = dp(4);
+        devicePill.addView(chevron, chevronParams);
+
+        header.addView(devicePill);
+
+        headerSubtitle = Ui.text(this, "", 0, 0, Typeface.NORMAL);
+        headerSubtitle.setVisibility(View.GONE);
+        header.addView(headerSubtitle);
+
+        modeBadge = Ui.text(this, "", 0, 0, Typeface.NORMAL);
+        modeBadge.setVisibility(View.GONE);
+        header.addView(modeBadge);
+
+        powerBadge = Ui.text(this, "", 0, 0, Typeface.NORMAL);
+        powerBadge.setVisibility(View.GONE);
+        header.addView(powerBadge);
+
+        Space rightSpace = new Space(this);
+        header.addView(rightSpace, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        ImageButton appsBtn = new ImageButton(this);
+        appsBtn.setImageResource(R.drawable.ic_apps);
+        appsBtn.setColorFilter(getColor(R.color.text));
+        appsBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        appsBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        appsBtn.setContentDescription(getString(R.string.apps));
+        appsBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            showApps();
+        });
+        LinearLayout.LayoutParams appsParams = new LinearLayout.LayoutParams(circleBtnSize, circleBtnSize);
+        appsParams.rightMargin = dp(4);
+        header.addView(appsBtn, appsParams);
+
+        ImageButton inputsBtn = new ImageButton(this);
+        inputsBtn.setImageResource(R.drawable.ic_input);
+        inputsBtn.setColorFilter(getColor(R.color.text));
+        inputsBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        inputsBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        inputsBtn.setContentDescription(getString(R.string.inputs));
+        inputsBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            showInputs();
+        });
+        LinearLayout.LayoutParams inputsParams = new LinearLayout.LayoutParams(circleBtnSize, circleBtnSize);
+        inputsParams.rightMargin = dp(4);
+        header.addView(inputsBtn, inputsParams);
+
+        ImageButton power = new ImageButton(this);
+        power.setImageResource(R.drawable.ic_power);
+        power.setColorFilter(getColor(R.color.danger));
+        power.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        power.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        power.setContentDescription(getString(R.string.power));
+        power.setOnClickListener(v -> {
+            clickHaptic(v);
+            powerPressed();
+        });
+        power.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            wakeBoxCec(true);
+            return true;
+        });
+        header.addView(power, new LinearLayout.LayoutParams(circleBtnSize, circleBtnSize));
+
         content.addView(header);
 
         banner = Ui.row(this);
@@ -577,23 +1520,22 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         banner.setVisibility(View.GONE);
         LinearLayout.LayoutParams bannerParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        bannerParams.topMargin = dp(12);
+        bannerParams.topMargin = dp(6);
         content.addView(banner, bannerParams);
 
         LinearLayout tabs = Ui.row(this);
-        tabs.setPadding(dp(4), dp(4), dp(4), dp(4));
-        tabs.setBackground(Ui.round(this, getColor(R.color.surface), 17,
+        tabs.setGravity(Gravity.CENTER);
+        tabs.setPadding(dp(3), dp(3), dp(3), dp(3));
+        tabs.setBackground(Ui.round(this, getColor(R.color.surface), 16,
                 getColor(R.color.stroke), 1));
-        int tabBarHeight = landscape ? dp(36) : dp(44);
-        int tabHeight = landscape ? dp(28) : dp(36);
-        LinearLayout.LayoutParams tabsParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, tabBarHeight);
-        tabsParams.topMargin = landscape ? dp(7) : dp(14);
+        LinearLayout.LayoutParams tabsParams = new LinearLayout.LayoutParams(dp(220), dp(28));
+        tabsParams.gravity = Gravity.CENTER_HORIZONTAL;
+        tabsParams.topMargin = dp(6);
         content.addView(tabs, tabsParams);
         buttonsTab = tabLabel(getString(R.string.buttons));
         trackpadTab = tabLabel(getString(R.string.trackpad));
-        tabs.addView(buttonsTab, new LinearLayout.LayoutParams(0, tabHeight, 1f));
-        tabs.addView(trackpadTab, new LinearLayout.LayoutParams(0, tabHeight, 1f));
+        tabs.addView(buttonsTab, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        tabs.addView(trackpadTab, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
         buttonsTab.setOnClickListener(v -> {
             clickHaptic(v);
             showMode(true);
@@ -605,72 +1547,596 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
         FrameLayout modes = new FrameLayout(this);
         LinearLayout.LayoutParams modesParams = new LinearLayout.LayoutParams(
-                landscape ? landscapeBoardWidth() : ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT);
-        modesParams.topMargin = landscape ? dp(8) : dp(14);
-        if (landscape) {
-            modesParams.gravity = Gravity.CENTER_HORIZONTAL;
-        }
+                landscapeBoardWidth(), ViewGroup.LayoutParams.WRAP_CONTENT);
+        modesParams.topMargin = dp(6);
+        modesParams.gravity = Gravity.CENTER_HORIZONTAL;
         content.addView(modes, modesParams);
 
         buttonsPanel = buildButtonsPanel();
-        trackpadPanel = buildTrackpadPanel();
         modes.addView(buttonsPanel, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        modes.addView(trackpadPanel, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        trackpadPanel.setVisibility(View.GONE);
-        styleTabs();
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        if (!landscape) {
-            Space pushDown = new Space(this);
-            content.addView(pushDown, new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        }
-        // Landscape phones have very little vertical room, so the bar scrolls with the
-        // controls instead of being pinned. It still has to exist: the TV and box both
-        // route their on-screen text fields through it.
+        trackpadPanel = buildTrackpadPanel();
+        modes.addView(trackpadPanel, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        trackpadPanel.setVisibility(View.GONE);
+
+        styleTabs();
         content.addView(buildTvKeyboardBar());
 
         return scroll;
     }
 
-    /** Persistent text entry and device-settings actions, anchored to the bottom of the phone. */
+    private View buildBroadcastPage() {
+        LinearLayout row = Ui.row(this);
+        row.setGravity(Gravity.CENTER);
+        row.setPadding(dp(4), 0, dp(4), 0);
+
+        // 1. VOL Rocker (Left)
+        View volRocker = buildVerticalRocker(
+                R.drawable.ic_vol_up, "VOL", R.drawable.ic_vol_down,
+                () -> sendButton("VOLUMEUP"),
+                () -> sendButton("VOLUMEDOWN"),
+                () -> sendButton("MUTE")
+        );
+        LinearLayout.LayoutParams volParams = new LinearLayout.LayoutParams(dp(82), dp(142));
+        volParams.rightMargin = dp(10);
+        row.addView(volRocker, volParams);
+
+        // 2. Center Stack: 123 (Numpad) on top, GUIDE on bottom
+        LinearLayout centerStack = Ui.column(this);
+        centerStack.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams centerParams = new LinearLayout.LayoutParams(dp(105), dp(142));
+        centerParams.rightMargin = dp(10);
+        row.addView(centerStack, centerParams);
+
+        // Top: 123 button with color dots
+        LinearLayout numpadBtn = Ui.column(this);
+        numpadBtn.setGravity(Gravity.CENTER);
+        numpadBtn.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 22, getColor(R.color.stroke), 1));
+        numpadBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            showNumberPadDialog();
+        });
+
+        TextView numText = Ui.text(this, "123", 15, getColor(R.color.text), Typeface.BOLD);
+        numpadBtn.addView(numText);
+
+        LinearLayout colorDots = Ui.row(this);
+        colorDots.setGravity(Gravity.CENTER);
+        colorDots.setPadding(0, dp(3), 0, 0);
+
+        int dotSize = dp(5);
+        int[] colors = {0xFFF44336, 0xFF4CAF50, 0xFFFFEB3B, 0xFF2196F3}; // Red, Green, Yellow, Blue
+        for (int c : colors) {
+            View dot = new View(this);
+            dot.setBackground(Ui.round(this, c, 99));
+            LinearLayout.LayoutParams dp = new LinearLayout.LayoutParams(dotSize, dotSize);
+            dp.setMargins(dp(1.5f), 0, dp(1.5f), 0);
+            colorDots.addView(dot, dp);
+        }
+        numpadBtn.addView(colorDots);
+
+        LinearLayout.LayoutParams numpadParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        numpadParams.bottomMargin = dp(6);
+        centerStack.addView(numpadBtn, numpadParams);
+
+        // Bottom: GUIDE button
+        LinearLayout guideBtn = Ui.row(this);
+        guideBtn.setGravity(Gravity.CENTER);
+        guideBtn.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 22, getColor(R.color.stroke), 1));
+        guideBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            sendButton("GUIDE");
+        });
+
+        ImageView guideIcon = Ui.icon(this, R.drawable.ic_guide, getColor(R.color.muted), 16);
+        guideBtn.addView(guideIcon);
+
+        TextView guideText = Ui.text(this, " GUIDE", 11.5f, getColor(R.color.text), Typeface.BOLD);
+        guideBtn.addView(guideText);
+
+        LinearLayout.LayoutParams guideParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        guideParams.topMargin = dp(6);
+        centerStack.addView(guideBtn, guideParams);
+
+        // 3. CH Rocker (Right)
+        View chRocker = buildVerticalRocker(
+                R.drawable.ic_chevron_up, "CH", R.drawable.ic_chevron_down,
+                () -> sendButton("CHANNELUP"),
+                () -> sendButton("CHANNELDOWN"),
+                () -> sendButton("INFO")
+        );
+        LinearLayout.LayoutParams chParams = new LinearLayout.LayoutParams(dp(82), dp(142));
+        row.addView(chRocker, chParams);
+
+        return row;
+    }
+
+    private View buildVerticalRocker(int upIcon, String label, int downIcon,
+                                     Runnable onUp, Runnable onDown, Runnable onCenter) {
+        LinearLayout rocker = Ui.column(this);
+        rocker.setGravity(Gravity.CENTER);
+        rocker.setBackground(Ui.round(this, getColor(R.color.surface_2), 24, getColor(R.color.stroke), 1));
+
+        // Up button
+        FrameLayout upBtn = new FrameLayout(this);
+        upBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 24));
+        ImageView upImg = Ui.icon(this, upIcon, getColor(R.color.text), 20);
+        upBtn.addView(upImg, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        attachRepeat(upBtn, onUp);
+        rocker.addView(upBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // Center label (clickable e.g. for MUTE or INFO)
+        TextView lbl = Ui.text(this, label, 11f, getColor(R.color.muted), Typeface.BOLD);
+        lbl.setGravity(Gravity.CENTER);
+        lbl.setPadding(0, dp(2), 0, dp(2));
+        if (onCenter != null) {
+            lbl.setClickable(true);
+            lbl.setOnClickListener(v -> {
+                clickHaptic(v);
+                onCenter.run();
+            });
+        }
+        if ("VOL".equals(label)) {
+            volumeLabel = lbl;
+        }
+        rocker.addView(lbl);
+
+        // Down button
+        FrameLayout downBtn = new FrameLayout(this);
+        downBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 24));
+        ImageView downImg = Ui.icon(this, downIcon, getColor(R.color.text), 20);
+        downBtn.addView(downImg, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        attachRepeat(downBtn, onDown);
+        rocker.addView(downBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        return rocker;
+    }
+
+    private View buildMediaPage() {
+        LinearLayout row = Ui.row(this);
+        row.setGravity(Gravity.CENTER);
+        row.setPadding(dp(4), 0, dp(4), 0);
+
+        // 1. VOL Rocker on left
+        View volRocker = buildVerticalRocker(
+                R.drawable.ic_vol_up, "VOL", R.drawable.ic_vol_down,
+                () -> sendButton("VOLUMEUP"),
+                () -> sendButton("VOLUMEDOWN"),
+                () -> sendButton("MUTE")
+        );
+        LinearLayout.LayoutParams volParams = new LinearLayout.LayoutParams(dp(82), dp(142));
+        volParams.rightMargin = dp(12);
+        row.addView(volRocker, volParams);
+
+        // 2. Media transport controls on right
+        LinearLayout mediaStack = Ui.column(this);
+        mediaStack.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams mediaParams = new LinearLayout.LayoutParams(dp(200), dp(142));
+        row.addView(mediaStack, mediaParams);
+
+        // Top: Play / Pause wide pill
+        FrameLayout playPauseBtn = new FrameLayout(this);
+        playPauseBtn.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 22, getColor(R.color.stroke), 1));
+        ImageView ppIcon = Ui.icon(this, R.drawable.ic_play_pause, getColor(R.color.text), 24);
+        playPauseBtn.addView(ppIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        playPauseBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            sendButton("PLAY");
+        });
+        LinearLayout.LayoutParams playParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        playParams.bottomMargin = dp(6);
+        mediaStack.addView(playPauseBtn, playParams);
+
+        // Bottom: Rewind & Fast Forward wide pill
+        LinearLayout rwdFwdPill = Ui.row(this);
+        rwdFwdPill.setGravity(Gravity.CENTER);
+        rwdFwdPill.setBackground(Ui.round(this, getColor(R.color.surface_2), 22, getColor(R.color.stroke), 1));
+
+        FrameLayout rwdBtn = new FrameLayout(this);
+        rwdBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 22));
+        ImageView rwdIcon = Ui.icon(this, R.drawable.ic_rewind, getColor(R.color.text), 22);
+        rwdBtn.addView(rwdIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        rwdBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            sendButton("REWIND");
+        });
+        rwdFwdPill.addView(rwdBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        View sep = new View(this);
+        sep.setBackgroundColor(getColor(R.color.stroke));
+        rwdFwdPill.addView(sep, new LinearLayout.LayoutParams(dp(1), dp(24)));
+
+        FrameLayout fwdBtn = new FrameLayout(this);
+        fwdBtn.setBackground(Ui.pressable(this, Color.TRANSPARENT, 22));
+        ImageView fwdIcon = Ui.icon(this, R.drawable.ic_forward, getColor(R.color.text), 22);
+        fwdBtn.addView(fwdIcon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        fwdBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            sendButton("FASTFORWARD");
+        });
+        rwdFwdPill.addView(fwdBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        LinearLayout.LayoutParams rfParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        rfParams.topMargin = dp(6);
+        mediaStack.addView(rwdFwdPill, rfParams);
+
+        return row;
+    }
+
+    private View buildQuickAppsPage() {
+        LinearLayout panel = Ui.column(this);
+        panel.setGravity(Gravity.CENTER);
+        panel.setPadding(dp(12), dp(4), dp(12), dp(4));
+
+        LinearLayout row1 = Ui.row(this);
+        row1.setGravity(Gravity.CENTER);
+        panel.addView(row1, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        LinearLayout row2 = Ui.row(this);
+        row2.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams r2Params = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+        r2Params.topMargin = dp(6);
+        panel.addView(row2, r2Params);
+
+        row1.addView(quickAppTile(R.drawable.ic_tv, "Live TV", () -> {
+            if (service != null) service.launchApp("com.webos.app.livetv");
+        }), weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 4));
+
+        row1.addView(quickAppTile(R.drawable.ic_play_pause, "YouTube", () -> {
+            if (service != null) service.launchApp("youtube.leanback.v4");
+        }), weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 4, 4));
+
+        row1.addView(quickAppTile(R.drawable.ic_input, "Den", () -> {
+            String boxId = SecureStore.getBoxInputId(this);
+            if (service != null && boxId != null && !boxId.isEmpty()) {
+                service.switchInput(boxId);
+            } else if (service != null) {
+                service.switchInput("HDMI_1");
+            }
+        }), weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 4, 4));
+
+        row1.addView(quickAppTile(R.drawable.ic_apps, "All Apps", this::showApps),
+                weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 4, 0));
+
+        row2.addView(quickAppTile(R.drawable.ic_home, "LG Home", this::lgHomePressed),
+                weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 4));
+
+        row2.addView(quickAppTile(R.drawable.ic_mic, "Voice", () -> {
+            if (service != null) service.sendButton("MENU");
+        }), weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 4, 4));
+
+        row2.addView(quickAppTile(R.drawable.ic_tv_settings, "TV Menu", () -> {
+            if (service != null) service.sendLgButton("MENU");
+        }), weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 4, 4));
+
+        row2.addView(quickAppTile(R.drawable.ic_gear, "Settings", this::showSettings),
+                weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 4, 0));
+
+        return panel;
+    }
+
+    private View quickAppTile(int iconRes, String title, Runnable action) {
+        LinearLayout tile = Ui.column(this);
+        tile.setGravity(Gravity.CENTER);
+        tile.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 16, getColor(R.color.stroke), 1));
+        tile.setPadding(dp(4), dp(8), dp(4), dp(8));
+
+        ImageView icon = Ui.icon(this, iconRes, getColor(R.color.text), 22);
+        tile.addView(icon);
+
+        TextView label = Ui.text(this, title, 10.5f, getColor(R.color.muted), Typeface.BOLD);
+        label.setSingleLine(true);
+        label.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        label.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(4);
+        tile.addView(label, lp);
+
+        tile.setOnClickListener(v -> {
+            clickHaptic(v);
+            action.run();
+        });
+        return tile;
+    }
+
+    private LinearLayout buildCarouselDots(int count) {
+        LinearLayout row = Ui.row(this);
+        row.setGravity(Gravity.CENTER);
+        carouselDots.clear();
+        for (int i = 0; i < count; i++) {
+            final int pageIndex = i;
+            View dot = new View(this);
+            dot.setBackground(Ui.round(this, i == 0 ? getColor(R.color.accent) : getColor(R.color.stroke), 99));
+            int w = (i == 0 ? dp(14) : dp(6));
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(w, dp(6));
+            p.setMargins(dp(3), 0, dp(3), 0);
+            dot.setLayoutParams(p);
+            dot.setOnClickListener(v -> {
+                if (carousel != null) {
+                    carousel.setPage(pageIndex, true);
+                }
+            });
+            carouselDots.add(dot);
+            row.addView(dot);
+        }
+        return row;
+    }
+
+    private void updateCarouselDots(int activeIndex) {
+        for (int i = 0; i < carouselDots.size(); i++) {
+            View dot = carouselDots.get(i);
+            boolean active = i == activeIndex;
+            dot.setBackground(Ui.round(this, active ? getColor(R.color.accent) : getColor(R.color.stroke), 99));
+            LinearLayout.LayoutParams p = (LinearLayout.LayoutParams) dot.getLayoutParams();
+            p.width = active ? dp(14) : dp(6);
+            dot.setLayoutParams(p);
+        }
+    }
+
+    private View buildLowerStage() {
+        FrameLayout stage = new FrameLayout(this);
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        int dpadSize = Math.min(dp(290), Math.max(dp(240), screenWidth - dp(70)));
+
+        LinearLayout stageRow = Ui.row(this);
+        stageRow.setGravity(Gravity.CENTER_VERTICAL);
+        stage.addView(stageRow, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // Side action column on left
+        LinearLayout sideCol = Ui.column(this);
+        sideCol.setGravity(Gravity.CENTER_HORIZONTAL);
+        stageRow.addView(sideCol, new LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        ImageButton muteSideBtn = new ImageButton(this);
+        muteSideBtn.setImageResource(R.drawable.ic_mute);
+        muteSideBtn.setColorFilter(getColor(R.color.text));
+        muteSideBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        muteSideBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        muteSideBtn.setContentDescription(getString(R.string.mute));
+        muteSideBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            sendButton("MUTE");
+        });
+        sideCol.addView(muteSideBtn, new LinearLayout.LayoutParams(dp(38), dp(38)));
+        muteIcons.add(muteSideBtn);
+
+        Space sideSpacer = new Space(this);
+        sideCol.addView(sideSpacer, new LinearLayout.LayoutParams(1, dp(130)));
+
+        ImageButton pointerToggleBtn = new ImageButton(this);
+        pointerToggleBtn.setImageResource(R.drawable.ic_pointer);
+        pointerToggleBtn.setColorFilter(getColor(R.color.text));
+        pointerToggleBtn.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        pointerToggleBtn.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        pointerToggleBtn.setContentDescription(getString(R.string.trackpad));
+        pointerToggleBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            toggleControlMode();
+        });
+        sideCol.addView(pointerToggleBtn, new LinearLayout.LayoutParams(dp(38), dp(38)));
+
+        // Center Stage: Holds D-Pad and Trackpad
+        FrameLayout centerStage = new FrameLayout(this);
+        stageRow.addView(centerStage, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+
+        dpad = new DpadView(this);
+        dpad.setHaptics(haptics);
+        dpad.setListener(new DpadView.Listener() {
+            @Override
+            public void onButton(String name) {
+                sendButton(name);
+            }
+
+            @Override
+            public void onButtonLongPress(String name) {
+                sendButtonLong(name);
+            }
+        });
+        FrameLayout.LayoutParams dpadParams = new FrameLayout.LayoutParams(dpadSize, dpadSize, Gravity.CENTER);
+        centerStage.addView(dpad, dpadParams);
+        keyControls.add(dpad);
+
+        trackpad = new TrackpadView(this);
+        trackpad.setPointerSpeed(SecureStore.getPointerSpeed(this));
+        trackpad.setHaptics(haptics);
+        trackpad.setListener(new TrackpadView.Listener() {
+            @Override
+            public void onMove(int dx, int dy, boolean buttonDown) {
+                if (service != null) {
+                    service.sendMove(dx, dy, buttonDown);
+                }
+            }
+
+            @Override
+            public void onClick() {
+                pointerClickPressed();
+            }
+
+            @Override
+            public void onScroll(int dx, int dy) {
+                if (service != null) {
+                    service.sendScroll(dx, dy);
+                }
+            }
+
+            @Override
+            public void onSecondaryClick() {
+                if (service != null) {
+                    service.sendSecondaryClick();
+                }
+            }
+        });
+        trackpad.setVisibility(View.GONE);
+        FrameLayout.LayoutParams trackpadParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        centerStage.addView(trackpad, trackpadParams);
+        keyControls.add(trackpad);
+
+        return stage;
+    }
+
+    private void toggleControlMode() {
+        showMode(!buttonsMode);
+    }
+
+    private View buildBottomNav() {
+        LinearLayout bar = Ui.row(this);
+        bar.setGravity(Gravity.CENTER);
+        bar.setPadding(dp(4), dp(8), dp(4), dp(4));
+
+        int btnHeight = dp(52);
+
+        // 1. Back button (Pill on left)
+        FrameLayout backBtn = new FrameLayout(this);
+        backBtn.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 26, getColor(R.color.stroke), 1));
+        ImageView backImg = Ui.icon(this, R.drawable.ic_back, getColor(R.color.text), 22);
+        backBtn.addView(backImg, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        attachRepeat(backBtn, () -> sendButton("BACK"), 400, 180);
+        bar.addView(backBtn, weighted(1f, btnHeight, 0, 6));
+        keyControls.add(backBtn);
+
+        // 2. Home button (Pill in center)
+        FrameLayout homeBtn = new FrameLayout(this);
+        homeBtn.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 26, getColor(R.color.stroke), 1));
+        ImageView homeImg = Ui.icon(this, R.drawable.ic_home, getColor(R.color.text), 22);
+        homeBtn.addView(homeImg, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        homeBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            homePressed();
+        });
+        homeBtn.setOnLongClickListener(v -> {
+            clickHaptic(v);
+            lgHomePressed();
+            return true;
+        });
+        bar.addView(homeBtn, weighted(1.15f, btnHeight, 6, 6));
+        keyControls.add(homeBtn);
+
+        // 3. Apps / Voice button (Pill on right)
+        FrameLayout appBtn = new FrameLayout(this);
+        appBtn.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 26, getColor(R.color.stroke), 1));
+        ImageView appImg = Ui.icon(this, R.drawable.ic_apps, getColor(R.color.text), 22);
+        appBtn.addView(appImg, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        appBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            showApps();
+        });
+        attachVoicePushToTalk(appBtn);
+        bar.addView(appBtn, weighted(1f, btnHeight, 6, 0));
+        keyControls.add(appBtn);
+
+        return bar;
+    }
+
+    private void showNumberPadDialog() {
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = sheet(dialog, "Number Pad");
+
+        // Color keys row
+        LinearLayout colorRow = Ui.row(this);
+        colorRow.setGravity(Gravity.CENTER);
+        colorRow.setPadding(0, dp(4), 0, dp(14));
+
+        int[] colors = {0xFFE53935, 0xFF43A047, 0xFFFDD835, 0xFF1E88E5};
+        String[] colorNames = {"RED", "GREEN", "YELLOW", "BLUE"};
+
+        for (int i = 0; i < colors.length; i++) {
+            final String cName = colorNames[i];
+            int color = colors[i];
+            FrameLayout colorBtn = new FrameLayout(this);
+            colorBtn.setBackground(Ui.pressable(this, color, 14));
+            colorBtn.setOnClickListener(v -> {
+                clickHaptic(v);
+                sendButton(cName);
+                toast(cName);
+            });
+            LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(0, dp(34), 1f);
+            cp.setMargins(dp(3), 0, dp(3), 0);
+            colorRow.addView(colorBtn, cp);
+        }
+        panel.addView(colorRow);
+
+        // 3x4 numeric keypad
+        String[][] keyLayout = {
+                {"1", "2", "3"},
+                {"4", "5", "6"},
+                {"7", "8", "9"},
+                {"-", "0", "✓"}
+        };
+
+        for (int r = 0; r < keyLayout.length; r++) {
+            LinearLayout row = Ui.row(this);
+            row.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
+            rowParams.topMargin = dp(6);
+            panel.addView(row, rowParams);
+
+            for (int c = 0; c < keyLayout[r].length; c++) {
+                final String key = keyLayout[r][c];
+                FrameLayout keyBtn = new FrameLayout(this);
+                keyBtn.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 16, getColor(R.color.stroke), 1));
+
+                TextView tv = Ui.text(this, key, 18, getColor(R.color.text), Typeface.BOLD);
+                keyBtn.addView(tv, new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+
+                keyBtn.setOnClickListener(v -> {
+                    clickHaptic(v);
+                    if ("-".equals(key)) {
+                        sendButton("DASH");
+                    } else if ("✓".equals(key)) {
+                        sendButton("ENTER");
+                    } else {
+                        sendButton(key);
+                    }
+                });
+
+                LinearLayout.LayoutParams kp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+                kp.setMargins(dp(4), 0, dp(4), 0);
+                row.addView(keyBtn, kp);
+            }
+        }
+
+        showSheet(dialog, panel);
+    }
+
+    /** Persistent text entry anchored at the bottom of the remote. */
     private View buildTvKeyboardBar() {
         LinearLayout card = Ui.column(this);
-        card.setPadding(dp(14), dp(13), dp(14), dp(13));
-        card.setBackground(Ui.round(this, getColor(R.color.surface), 18,
+        tvKeyboardBar = card;
+        card.setVisibility(View.VISIBLE);
+        card.setPadding(dp(14), dp(10), dp(14), dp(10));
+        card.setBackground(Ui.round(this, getColor(R.color.surface_2), 18,
                 getColor(R.color.stroke), 1));
         LinearLayout.LayoutParams cardParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        cardParams.topMargin = dp(14);
+        cardParams.topMargin = dp(8);
+        cardParams.bottomMargin = dp(4);
         card.setLayoutParams(cardParams);
 
-        LinearLayout header = Ui.row(this);
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        tvKeyboardLabel = Ui.text(this, getString(R.string.tv_keyboard_section), 11.5f,
-                getColor(R.color.muted), Typeface.BOLD);
-        header.addView(tvKeyboardLabel);
-        View spacer = new View(this);
-        header.addView(spacer, new LinearLayout.LayoutParams(0, dp(1), 1f));
-        TextView tvSettings = Ui.text(this, getString(R.string.device_settings), 11f,
-                getColor(R.color.accent), Typeface.BOLD);
-        tvSettings.setPadding(dp(10), dp(4), dp(2), dp(4));
-        tvSettings.setClickable(true);
-        tvSettings.setFocusable(true);
-        tvSettings.setContentDescription(getString(R.string.device_settings));
-        tvSettings.setOnClickListener(v -> {
-            clickHaptic(v);
-            deviceSettingsPressed();
-        });
-        header.addView(tvSettings);
-        card.addView(header);
-
         LinearLayout row = Ui.row(this);
-        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rowParams.topMargin = dp(8);
-        card.addView(row, rowParams);
+        row.setGravity(Gravity.CENTER_VERTICAL);
 
         tvTextField = new RemoteEditText(this);
         tvTextField.setBackspaceListener(this::backspaceEmptyDraft);
@@ -688,12 +2154,18 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         tvTextField.setImeOptions(EditorInfo.IME_ACTION_SEND
                 | EditorInfo.IME_FLAG_NO_EXTRACT_UI
                 | EditorInfo.IME_FLAG_NO_FULLSCREEN);
-        tvTextField.setPadding(dp(13), 0, dp(13), 0);
-        tvTextField.setBackground(Ui.round(this, getColor(R.color.surface_2), 13,
+        tvTextField.setPadding(dp(14), 0, dp(14), 0);
+        tvTextField.setBackground(Ui.round(this, getColor(R.color.surface), 14,
                 getColor(R.color.stroke), 1));
         tvTextField.setOnEditorActionListener((v, actionId, event) -> {
-            if (actionId == EditorInfo.IME_ACTION_SEND) {
-                sendTvText();
+            if (actionId == EditorInfo.IME_ACTION_SEND
+                    || actionId == EditorInfo.IME_ACTION_DONE
+                    || actionId == EditorInfo.IME_ACTION_GO
+                    || actionId == EditorInfo.IME_ACTION_SEARCH
+                    || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                        && event.getAction() == KeyEvent.ACTION_DOWN)) {
+                sendTvTextAndEnter();
+                hideKeyboard();
                 return true;
             }
             return false;
@@ -714,32 +2186,14 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 }
             }
         });
-        row.addView(tvTextField, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        row.addView(tvTextField, weighted(1f, 46, 0, 8));
+        View textMic = circularButton(R.drawable.ic_mic, getString(R.string.voice), 46, getColor(R.color.accent));
+        attachVoicePushToTalk(textMic);
+        row.addView(textMic, new LinearLayout.LayoutParams(dp(46), dp(46)));
         textControls.add(tvTextField);
+        textControls.add(textMic);
 
-        ImageButton delete = iconAction(R.drawable.ic_backspace,
-                getString(R.string.tv_keyboard_delete), false, this::deleteDraftOrRemote);
-        ImageButton enter = iconAction(R.drawable.ic_enter,
-                getString(R.string.tv_keyboard_enter), false, this::sendTvTextAndEnter);
-        ImageButton send = iconAction(R.drawable.ic_send,
-                getString(R.string.tv_keyboard_send), true, this::sendTvText);
-        LinearLayout.LayoutParams firstParams = new LinearLayout.LayoutParams(dp(46), dp(48));
-        firstParams.leftMargin = dp(7);
-        row.addView(delete, firstParams);
-        LinearLayout.LayoutParams secondParams = new LinearLayout.LayoutParams(dp(46), dp(48));
-        secondParams.leftMargin = dp(7);
-        row.addView(enter, secondParams);
-        LinearLayout.LayoutParams thirdParams = new LinearLayout.LayoutParams(dp(46), dp(48));
-        thirdParams.leftMargin = dp(7);
-        row.addView(send, thirdParams);
-
-        tvKeyboardHint = Ui.text(this, "", 11f,
-                getColor(R.color.muted), Typeface.NORMAL);
-        tvKeyboardHint.setVisibility(View.GONE);
-        LinearLayout.LayoutParams hintParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        hintParams.topMargin = dp(6);
-        card.addView(tvKeyboardHint, hintParams);
+        card.addView(row);
         return card;
     }
 
@@ -769,127 +2223,29 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         return view;
     }
 
-    private LinearLayout buildButtonsPanel() {
-        if (isLandscape()) {
-            return buildLandscapeButtonsPanel();
+    private boolean isLiveTvActive() {
+        if (service == null) return false;
+        String fg = service.getForegroundApp();
+        if (fg != null) {
+            String lower = fg.toLowerCase(Locale.ROOT);
+            if (lower.contains("livetv") || lower.contains("tv.channel") || lower.contains("antenna")) {
+                return true;
+            }
         }
-        LinearLayout panel = Ui.column(this);
-
-        LinearLayout quick = Ui.row(this);
-        View power = actionTile(R.drawable.ic_power, getString(R.string.power),
-                getColor(R.color.danger), this::powerPressed);
-        power.setOnLongClickListener(v -> {
-            clickHaptic(v);
-            wakeBoxCec(true);
-            return true;
-        });
-        View inputs = actionTile(R.drawable.ic_input, getString(R.string.inputs),
-                getColor(R.color.accent), this::showInputs);
-        View apps = tvAppsTile();
-        quick.addView(power, weighted(1f, 68, 0, 8));
-        quick.addView(inputs, weighted(1f, 68, 0, 8));
-        quick.addView(apps, weighted(1f, 68, 0, 0));
-        panel.addView(quick);
-        commandControls.add(inputs);
-        commandControls.add(apps);
-
-        LinearLayout padRow = Ui.row(this);
-        LinearLayout.LayoutParams padRowParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        padRowParams.topMargin = dp(14);
-        panel.addView(padRow, padRowParams);
-
-        dpad = new DpadView(this);
-        dpad.setHaptics(haptics);
-        dpad.setListener(new DpadView.Listener() {
-            @Override
-            public void onButton(String name) {
-                sendButton(name);
+        LgTvClient.TvInput active = service.getActiveInput();
+        if (active != null && active.label != null) {
+            String lower = active.label.toLowerCase(Locale.ROOT);
+            if (lower.contains("live tv") || lower.contains("antenna")) {
+                return true;
             }
+        }
+        return false;
+    }
 
-            @Override
-            public void onButtonLongPress(String name) {
-                sendButtonLong(name);
-            }
-        });
-        dpad.setLayoutParams(new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        padRow.addView(dpad);
-        keyControls.add(dpad);
 
-        LinearLayout volume = Ui.column(this);
-        LinearLayout.LayoutParams volumeParams = new LinearLayout.LayoutParams(dp(76),
-                ViewGroup.LayoutParams.MATCH_PARENT);
-        volumeParams.leftMargin = dp(10);
-        padRow.addView(volume, volumeParams);
 
-        volumeLabel = Ui.text(this, "VOL", 9, getColor(R.color.muted), Typeface.BOLD);
-        volumeLabel.setLetterSpacing(0.1f);
-        volumeLabel.setGravity(Gravity.CENTER);
-        volume.addView(volumeLabel, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(18)));
-
-        LinearLayout volUp = iconButton(R.drawable.ic_vol_up, getString(R.string.vol_up));
-        LinearLayout volDown = iconButton(R.drawable.ic_vol_down, getString(R.string.vol_down));
-        LinearLayout mute = iconButton(R.drawable.ic_mute, getString(R.string.mute));
-        volume.addView(volUp, volumeButtonParams(6));
-        volume.addView(volDown, volumeButtonParams(6));
-        volume.addView(mute, volumeButtonParams(0));
-        keyControls.add(volUp);
-        keyControls.add(volDown);
-        keyControls.add(mute);
-        muteIcons.add((ImageView) mute.getChildAt(0));
-        attachRepeat(volUp, () -> sendButton("VOLUMEUP"));
-        attachRepeat(volDown, () -> sendButton("VOLUMEDOWN"));
-        mute.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("MUTE");
-        });
-
-        LinearLayout nav = Ui.row(this);
-        LinearLayout.LayoutParams navParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        navParams.topMargin = dp(12);
-        panel.addView(nav, navParams);
-        View back = wideButton(R.drawable.ic_back, getString(R.string.back), 13);
-        View home = wideButton(R.drawable.ic_home, getString(R.string.home), 13);
-        nav.addView(back, weighted(1f, 54, 0, 8));
-        nav.addView(home, weighted(1f, 54, 0, 0));
-        attachRepeat(back, () -> sendButton("BACK"), 400, 180);
-        home.setOnClickListener(v -> {
-            clickHaptic(v);
-            homePressed();
-        });
-        home.setOnLongClickListener(v -> {
-            clickHaptic(v);
-            lgHomePressed();
-            return true;
-        });
-        keyControls.add(back);
-        keyControls.add(home);
-
-        LinearLayout transport = Ui.row(this);
-        LinearLayout.LayoutParams transportParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        transportParams.topMargin = dp(8);
-        panel.addView(transport, transportParams);
-        View rewind = wideButton(R.drawable.ic_rewind, getString(R.string.rewind), null, 0);
-        View play = wideButton(R.drawable.ic_play_pause, getString(R.string.play_pause), null, 0);
-        View forward = wideButton(R.drawable.ic_forward, getString(R.string.forward), null, 0);
-        transport.addView(rewind, weighted(1f, 54, 0, 8));
-        transport.addView(play, weighted(1f, 54, 0, 8));
-        transport.addView(forward, weighted(1f, 54, 0, 0));
-        attachRepeat(rewind, () -> sendButton("REWIND"));
-        play.setOnClickListener(v -> {
-            clickHaptic(v);
-            sendButton("PLAY");
-        });
-        attachRepeat(forward, () -> sendButton("FASTFORWARD"));
-        keyControls.add(rewind);
-        keyControls.add(play);
-        keyControls.add(forward);
-
-        return panel;
+    private LinearLayout buildButtonsPanel() {
+        return buildLandscapeButtonsPanel();
     }
 
     /**
@@ -973,10 +2329,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
 
         LinearLayout nav = Ui.row(this);
         View back = wideButton(R.drawable.ic_back, getString(R.string.back), 13);
+        View mic = wideButton(R.drawable.ic_mic, getString(R.string.voice), 13);
         View home = wideButton(R.drawable.ic_home, getString(R.string.home), 13);
         nav.addView(back, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
+        nav.addView(mic, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 8));
         nav.addView(home, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
         attachRepeat(back, () -> sendButton("BACK"), 400, 180);
+        attachVoicePushToTalk(mic);
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
@@ -988,6 +2347,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         });
         controls.addView(nav, landscapeRowParams(8));
         keyControls.add(back);
+        keyControls.add(mic);
         keyControls.add(home);
 
         LinearLayout transport = Ui.row(this);
@@ -1083,12 +2443,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         LinearLayout nav = Ui.row(this);
         View back = wideButton(R.drawable.ic_back, getString(R.string.back), 12);
         View click = wideButton(R.drawable.ic_play_pause, getString(R.string.click), 12);
+        View mic = wideButton(R.drawable.ic_mic, getString(R.string.voice), 12);
         View home = wideButton(R.drawable.ic_home, getString(R.string.home), 12);
-        nav.addView(back, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 6));
-        nav.addView(click, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 6));
+        nav.addView(back, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 5));
+        nav.addView(click, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 5));
+        nav.addView(mic, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 5));
         nav.addView(home, weighted(1f, ViewGroup.LayoutParams.MATCH_PARENT, 0, 0));
         attachRepeat(back, () -> sendButton("BACK"), 400, 180);
         attachClickHold(click);
+        attachVoicePushToTalk(mic);
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
@@ -1101,6 +2464,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         controls.addView(nav, landscapeRowParams(8));
         keyControls.add(back);
         keyControls.add(click);
+        keyControls.add(mic);
         keyControls.add(home);
 
         LinearLayout volume = Ui.row(this);
@@ -1148,8 +2512,15 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return buildLandscapeTrackpadPanel();
         }
         LinearLayout panel = Ui.column(this);
+        panel.setGravity(Gravity.CENTER_HORIZONTAL);
+
+        // Top flexible spacer
+        Space topSpacer = new Space(this);
+        panel.addView(topSpacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.2f));
+
         int screenHeight = getResources().getDisplayMetrics().heightPixels;
-        int height = Math.max(dp(270), Math.min(dp(410), (int) (screenHeight * 0.44f)));
+        int height = Math.max(dp(240), Math.min(dp(290), (int) (screenHeight * 0.36f)));
         trackpad = new TrackpadView(this);
         trackpad.setPointerSpeed(SecureStore.getPointerSpeed(this));
         trackpad.setHaptics(haptics);
@@ -1184,19 +2555,29 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 ViewGroup.LayoutParams.MATCH_PARENT, height));
         keyControls.add(trackpad);
 
-        LinearLayout actions = Ui.row(this);
-        LinearLayout.LayoutParams actionsParams = new LinearLayout.LayoutParams(
+        // Flexible middle spacer pushing controls down into thumb zone
+        Space midSpacer = new Space(this);
+        panel.addView(midSpacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.8f));
+
+        // Row 1: Back (circle), Home (stadium pill), Mic (circle)
+        LinearLayout nav = Ui.row(this);
+        nav.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams navParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        actionsParams.topMargin = dp(12);
-        panel.addView(actions, actionsParams);
-        View back = wideButton(R.drawable.ic_back, getString(R.string.back), 13);
-        View click = wideButton(R.drawable.ic_play_pause, getString(R.string.click), 13);
-        View home = wideButton(R.drawable.ic_home, getString(R.string.home), 13);
-        actions.addView(back, weighted(1f, 54, 0, 8));
-        actions.addView(click, weighted(1f, 54, 0, 8));
-        actions.addView(home, weighted(1f, 54, 0, 0));
+        navParams.bottomMargin = dp(18);
+        panel.addView(nav, navParams);
+
+        View back = circularButton(R.drawable.ic_back, getString(R.string.back), 58);
+        View home = stadiumButtonWithText(R.drawable.ic_home, getString(R.string.home), 29);
+        View mic = circularButton(R.drawable.ic_mic, getString(R.string.voice), 58, getColor(R.color.green));
+
+        nav.addView(back, new LinearLayout.LayoutParams(dp(58), dp(58)));
+        nav.addView(home, weighted(1f, 58, 16, 16));
+        nav.addView(mic, new LinearLayout.LayoutParams(dp(58), dp(58)));
+
         attachRepeat(back, () -> sendButton("BACK"), 400, 180);
-        attachClickHold(click);
+        attachVoicePushToTalk(mic);
         home.setOnClickListener(v -> {
             clickHaptic(v);
             homePressed();
@@ -1207,21 +2588,71 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return true;
         });
         keyControls.add(back);
-        keyControls.add(click);
+        keyControls.add(mic);
         keyControls.add(home);
+
+        // Row 2: Mute (stadium), Vol- (stadium), Vol+ (stadium)
+        LinearLayout volumeRow = Ui.row(this);
+        volumeRow.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams volumeParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        panel.addView(volumeRow, volumeParams);
+
+        View mute = stadiumButton(R.drawable.ic_mute, getString(R.string.mute), 27);
+        View volDown = stadiumButtonWithText(R.drawable.ic_vol_down, "VOL −", 27);
+        View volUp = stadiumButtonWithText(R.drawable.ic_vol_up, "VOL +", 27);
+
+        volumeRow.addView(mute, new LinearLayout.LayoutParams(dp(64), dp(54)));
+        volumeRow.addView(volDown, weighted(1f, 54, 12, 6));
+        volumeRow.addView(volUp, weighted(1f, 54, 6, 0));
+
+        keyControls.add(mute);
+        keyControls.add(volDown);
+        keyControls.add(volUp);
+        if (mute instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) mute;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                if (g.getChildAt(i) instanceof ImageView) {
+                    muteIcons.add((ImageView) g.getChildAt(i));
+                }
+            }
+        }
+        mute.setOnClickListener(v -> {
+            clickHaptic(v);
+            sendButton("MUTE");
+        });
+        attachRepeat(volDown, () -> sendButton("VOLUMEDOWN"));
+        attachRepeat(volUp, () -> sendButton("VOLUMEUP"));
+
+        // Bottom flexible spacer
+        Space bottomSpacer = new Space(this);
+        panel.addView(bottomSpacer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 0.4f));
+
         return panel;
     }
 
     private void showMode(boolean buttons) {
         buttonsMode = buttons;
-        buttonsPanel.setVisibility(buttons ? View.VISIBLE : View.GONE);
-        trackpadPanel.setVisibility(buttons ? View.GONE : View.VISIBLE);
+        if (dpad != null) dpad.setVisibility(buttons ? View.VISIBLE : View.GONE);
+        if (trackpad != null) trackpad.setVisibility(buttons ? View.GONE : View.VISIBLE);
+        if (cornerToggleBtn != null) {
+            cornerToggleBtn.setImageResource(buttons ? R.drawable.ic_pointer : R.drawable.ic_dpad);
+            cornerToggleBtn.setContentDescription(getString(buttons ? R.string.trackpad : R.string.buttons));
+        }
+        if (isLandscape()) {
+            if (buttonsPanel != null) buttonsPanel.setVisibility(buttons ? View.VISIBLE : View.GONE);
+            if (trackpadPanel != null) trackpadPanel.setVisibility(buttons ? View.GONE : View.VISIBLE);
+        }
         styleTabs();
-        if (!buttons) {
+        if (!buttons && trackpad != null) {
             trackpad.setPointerSpeed(SecureStore.getPointerSpeed(this));
             trackpad.setHaptics(SecureStore.getHaptics(this));
             ensureBluetoothPermission();
             updateTrackpadLabels();
+            if (service != null && service.isBoxActive() && !service.isBoxMouseConnected() && service.getBoxMouse() != null) {
+                service.getBoxMouse().autoConnect();
+            }
         }
     }
 
@@ -1229,9 +2660,9 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (buttonsTab == null) {
             return;
         }
-        buttonsTab.setBackground(buttonsMode ? Ui.round(this, getColor(R.color.accent_dim), 13) : null);
+        buttonsTab.setBackground(buttonsMode ? Ui.round(this, getColor(R.color.secondary_container), 14) : null);
         buttonsTab.setTextColor(buttonsMode ? getColor(R.color.accent) : getColor(R.color.muted));
-        trackpadTab.setBackground(buttonsMode ? null : Ui.round(this, getColor(R.color.accent_dim), 13));
+        trackpadTab.setBackground(buttonsMode ? null : Ui.round(this, getColor(R.color.secondary_container), 14));
         trackpadTab.setTextColor(buttonsMode ? getColor(R.color.muted) : getColor(R.color.accent));
     }
 
@@ -1299,6 +2730,56 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             action.run();
         });
         return tile;
+    }
+
+    private View circularButton(int iconRes, String description, int sizeDp) {
+        return circularButton(iconRes, description, sizeDp, getColor(R.color.text));
+    }
+
+    private View circularButton(int iconRes, String description, int sizeDp, int iconColor) {
+        FrameLayout button = new FrameLayout(this);
+        button.setBackground(Ui.circle(this, getColor(R.color.surface_2), getColor(R.color.stroke)));
+        button.setClickable(true);
+        button.setFocusable(true);
+        button.setContentDescription(description);
+        ImageView icon = Ui.icon(this, iconRes, iconColor, 22);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                dp(22), dp(22), Gravity.CENTER);
+        button.addView(icon, params);
+        return button;
+    }
+
+    private View stadiumButton(int iconRes, String description, float radiusDp) {
+        FrameLayout button = new FrameLayout(this);
+        button.setBackground(Ui.pressable(this, getColor(R.color.surface_2), radiusDp,
+                getColor(R.color.stroke), 1));
+        button.setClickable(true);
+        button.setFocusable(true);
+        button.setContentDescription(description);
+        ImageView icon = Ui.icon(this, iconRes, getColor(R.color.text), 22);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                dp(22), dp(22), Gravity.CENTER);
+        button.addView(icon, params);
+        return button;
+    }
+
+    private View stadiumButtonWithText(int iconRes, String label, float radiusDp) {
+        LinearLayout button = Ui.row(this);
+        button.setGravity(Gravity.CENTER);
+        button.setBackground(Ui.pressable(this, getColor(R.color.surface_2), radiusDp,
+                getColor(R.color.stroke), 1));
+        button.setClickable(true);
+        button.setFocusable(true);
+        button.setContentDescription(label);
+        if (iconRes != 0) {
+            ImageView icon = Ui.icon(this, iconRes, getColor(R.color.text), 18);
+            LinearLayout.LayoutParams iconParams = new LinearLayout.LayoutParams(dp(18), dp(18));
+            iconParams.rightMargin = dp(6);
+            button.addView(icon, iconParams);
+        }
+        TextView text = Ui.text(this, label, 12.5f, getColor(R.color.text), Typeface.BOLD);
+        button.addView(text);
+        return button;
     }
 
     private LinearLayout iconButton(int iconRes, String description) {
@@ -1380,6 +2861,34 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (headerTitle == null) {
             return;
         }
+        updateModeBadge();
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            boolean paired = AndroidTvRemote.isPaired(this);
+            boolean ready = AndroidTvRemote.isMonitorReady();
+            String boxName = SecureStore.getBoxName(this);
+            headerTitle.setText((boxName != null && !boxName.isEmpty()) ? boxName : getString(R.string.mode_android_tv));
+            if (!paired) {
+                styleDot(getColor(R.color.danger));
+                headerSubtitle.setText(R.string.tv_keyboard_box_unpaired);
+                tintBanner(getColor(R.color.amber));
+                showBanner(getString(R.string.box_not_paired), getString(R.string.box_pair), this::showBoxSetupPrompt);
+            } else if (ready) {
+                styleDot(getColor(R.color.green));
+                headerSubtitle.setText(R.string.connected);
+                hideBanner();
+            } else {
+                styleDot(getColor(R.color.amber));
+                headerSubtitle.setText(R.string.connecting);
+                hideBanner();
+            }
+            setPowerBadge(ready ? "ON" : "…",
+                    ready ? getColor(R.color.green) : getColor(R.color.muted),
+                    getColor(R.color.surface_2), getColor(R.color.stroke));
+            updatePowerButton();
+            refreshEnabled();
+            return;
+        }
         if (service == null) {
             String ip = SecureStore.getSavedIp(this);
             headerTitle.setText(savedName());
@@ -1387,15 +2896,27 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             styleDot(getColor(R.color.amber));
             setPowerBadge("…", getColor(R.color.muted),
                     getColor(R.color.surface_2), getColor(R.color.stroke));
+            updatePowerButton();
             refreshEnabled();
             return;
         }
         String ip = service.getIp();
-        String name = service.displayName();
-        headerTitle.setText(cleanName(name));
+        if (service.isBoxActive()) {
+            String boxName = SecureStore.getBoxName(this);
+            headerTitle.setText((boxName != null && !boxName.isEmpty()) ? boxName : "Den");
+        } else if (foregroundApp != null && foregroundApp.contains("livetv")) {
+            headerTitle.setText("Live TV");
+        } else if (service.getActiveInput() != null && service.getActiveInput().label != null) {
+            headerTitle.setText(service.getActiveInput().label);
+        } else {
+            String name = service.displayName();
+            headerTitle.setText(cleanName(name));
+        }
         LgTvClient.State state = service.getState();
         String detail = service.getDetail();
         updatePowerBadge(state);
+        updatePowerButton();
+        updateRightDeckRocker();
         switch (state) {
             case READY:
                 styleDot(getColor(R.color.green));
@@ -1445,6 +2966,17 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 break;
         }
         refreshEnabled();
+        if (volumeLabel != null && service != null) {
+            int vol = service.getVolume();
+            boolean muted = service.isMuted();
+            if (muted) {
+                volumeLabel.setText(R.string.muted);
+                volumeLabel.setTextColor(getColor(R.color.danger));
+            } else if (vol >= 0) {
+                volumeLabel.setText(String.format(java.util.Locale.US, "VOL %d", vol));
+                volumeLabel.setTextColor(getColor(R.color.accent));
+            }
+        }
         if (!setupVisible) {
             remoteView.setVisibility(View.VISIBLE);
             setupView.setVisibility(View.GONE);
@@ -1454,12 +2986,14 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private String readyDetail() {
         StringBuilder line = new StringBuilder(
                 service == null ? getString(R.string.connected) : service.getTvPowerLabel());
-        String input = service == null ? null : service.getActiveInputLabel();
         if (service != null && service.isBoxActive()) {
-            input = getString(R.string.android_tv_box);
-        }
-        if (input != null && !input.isEmpty()) {
-            line.append(" · ").append(input);
+            String boxInputLabel = SecureStore.getBoxInputLabel(this);
+            line.append(" · ").append(boxInputLabel != null && !boxInputLabel.isEmpty() ? boxInputLabel : getString(R.string.android_tv_box));
+        } else if (service != null) {
+            String appTitle = service.getActiveAppTitle();
+            if (appTitle != null && !appTitle.isEmpty()) {
+                line.append(" · ").append(appTitle);
+            }
         }
         return line.toString();
     }
@@ -1497,6 +3031,23 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
     }
 
+    private void updatePowerButton() {
+        if (powerBtn == null) return;
+        int color;
+        if (service != null && service.isConnected()) {
+            if (service.isScreenOff() || service.isTvOff()) {
+                color = getColor(R.color.amber); // Standby: Orange
+            } else {
+                color = getColor(R.color.green); // On: Green
+            }
+        } else if (service != null && (service.getState() == LgTvClient.State.CONNECTING || service.getState() == LgTvClient.State.PAIRING)) {
+            color = getColor(R.color.amber); // Standby / Connecting: Orange
+        } else {
+            color = getColor(R.color.danger); // Off / Disconnected: Red
+        }
+        powerBtn.setBackground(Ui.circle(this, color, color));
+    }
+
     private void setPowerBadge(String text, int textColor, int fill, int stroke) {
         powerBadge.setText(text);
         powerBadge.setTextColor(textColor);
@@ -1506,8 +3057,126 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private void styleDot(int color) {
         GradientDrawable dot = new GradientDrawable();
         dot.setShape(GradientDrawable.OVAL);
-        dot.setColor(color);
+        if (color == getColor(R.color.green)) {
+            dot.setColor(getColor(R.color.on_accent));
+        } else {
+            dot.setColor(color);
+        }
         statusDot.setBackground(dot);
+    }
+
+    private String modeBadgeText() {
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            return getString(R.string.mode_android_tv);
+        } else if (mode == SecureStore.MODE_LG_TV) {
+            return getString(R.string.mode_lg_tv);
+        }
+        return getString(R.string.mode_unified);
+    }
+
+    private void updateModeBadge() {
+        if (modeBadge != null) {
+            modeBadge.setText(modeBadgeText());
+        }
+    }
+
+    private View buildOptionCard(int iconRes, String title, String subtitle, boolean selected, Runnable onClick) {
+        LinearLayout row = Ui.row(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), dp(13), dp(16), dp(13));
+        row.setBackground(Ui.pressable(this,
+                selected ? getColor(R.color.secondary_container) : getColor(R.color.surface_2),
+                16,
+                selected ? getColor(R.color.accent) : getColor(R.color.stroke),
+                selected ? 1.5f : 1f));
+        LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rowParams.bottomMargin = dp(10);
+        row.setLayoutParams(rowParams);
+        row.setClickable(true);
+        row.setFocusable(true);
+
+        FrameLayout iconBox = new FrameLayout(this);
+        iconBox.setBackground(Ui.circle(this,
+                selected ? getColor(R.color.accent_dim) : getColor(R.color.surface),
+                getColor(R.color.stroke)));
+        ImageView icon = Ui.icon(this, iconRes,
+                selected ? getColor(R.color.accent) : getColor(R.color.text), 20);
+        FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER);
+        iconBox.addView(icon, iconParams);
+        row.addView(iconBox, new LinearLayout.LayoutParams(dp(42), dp(42)));
+
+        LinearLayout textCol = Ui.column(this);
+        LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        textParams.leftMargin = dp(14);
+        row.addView(textCol, textParams);
+
+        TextView titleView = Ui.text(this, title, 15f,
+                selected ? getColor(R.color.accent) : getColor(R.color.text), Typeface.BOLD);
+        textCol.addView(titleView);
+
+        if (subtitle != null && !subtitle.isEmpty()) {
+            TextView subView = Ui.text(this, subtitle, 12f, getColor(R.color.muted), Typeface.NORMAL);
+            LinearLayout.LayoutParams subParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            subParams.topMargin = dp(2);
+            textCol.addView(subView, subParams);
+        }
+
+        if (selected) {
+            TextView check = Ui.text(this, "✓", 16f, getColor(R.color.accent), Typeface.BOLD);
+            row.addView(check);
+        } else {
+            row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 16));
+        }
+
+        row.setOnClickListener(v -> {
+            clickHaptic(v);
+            onClick.run();
+        });
+        return row;
+    }
+
+    private void showDeviceModeDialog() {
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = sheet(dialog, getString(R.string.choose_remote_mode));
+        int current = SecureStore.getDeviceMode(this);
+
+        panel.addView(buildOptionCard(R.drawable.ic_tv, getString(R.string.mode_unified),
+                getString(R.string.mode_unified_desc), current == SecureStore.MODE_AUTO, () -> {
+                    dialog.dismiss();
+                    if (current != SecureStore.MODE_AUTO) setDeviceModeAndRefresh(SecureStore.MODE_AUTO);
+                }));
+
+        panel.addView(buildOptionCard(R.drawable.ic_apps, getString(R.string.mode_android_tv),
+                getString(R.string.mode_android_tv_desc), current == SecureStore.MODE_ANDROID_TV, () -> {
+                    dialog.dismiss();
+                    if (current != SecureStore.MODE_ANDROID_TV) setDeviceModeAndRefresh(SecureStore.MODE_ANDROID_TV);
+                }));
+
+        panel.addView(buildOptionCard(R.drawable.ic_tv, getString(R.string.mode_lg_tv),
+                getString(R.string.mode_lg_tv_desc), current == SecureStore.MODE_LG_TV, () -> {
+                    dialog.dismiss();
+                    if (current != SecureStore.MODE_LG_TV) setDeviceModeAndRefresh(SecureStore.MODE_LG_TV);
+                }));
+
+        showSheet(dialog, panel);
+    }
+
+    private void setDeviceModeAndRefresh(int mode) {
+        SecureStore.setDeviceMode(this, mode);
+        updateModeBadge();
+        if (service != null) {
+            service.onModeChanged();
+        }
+        if (mode == SecureStore.MODE_ANDROID_TV && !AndroidTvRemote.isPaired(this)) {
+            showBoxSetupPrompt();
+        } else if (mode == SecureStore.MODE_LG_TV && SecureStore.getSavedIp(this) == null) {
+            showSetup(true);
+        }
+        renderConnection();
     }
 
     private void showBanner(String text, String action, Runnable runnable) {
@@ -1674,6 +3343,20 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             renderConnection();
         }
         maybeOpenTextKeyboard();
+        updateTrackpadLabels();
+        updateRightDeckRocker();
+
+        if (carousel != null) {
+            if (service != null && service.isBoxActive()) {
+                if (carousel.getCurrentPage() == 0) {
+                    carousel.setPage(1, true);
+                }
+            } else if (foregroundApp.contains("livetv")) {
+                if (carousel.getCurrentPage() == 1) {
+                    carousel.setPage(0, true);
+                }
+            }
+        }
     }
 
     @Override
@@ -1691,15 +3374,14 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         Log.d("LgRemote", "TV text field focused=" + focused + " hidden=" + hidden
                 + " type=" + contentType);
         if (focused && !hidden) {
+            setTvKeyboardBarVisible(true);
             maybeOpenTextKeyboard();
         } else {
             textAutoOpened = false;
             if (service == null || !service.isBoxActive()) {
                 resetTextSession();
-                if (tvTextField.hasFocus()) {
-                    tvTextField.clearFocus();
-                    hideKeyboard();
-                }
+                hideKeyboard();
+                setTvKeyboardBarVisible(false);
             }
         }
     }
@@ -1710,17 +3392,24 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
         if (focused) {
+            setTvKeyboardBarVisible(true);
             maybeOpenTextKeyboard();
         } else {
             boxTextAutoOpened = false;
             if (service != null && service.isBoxActive()) {
                 resetTextSession();
-                if (tvTextField.hasFocus()) {
-                    tvTextField.clearFocus();
-                    hideKeyboard();
-                }
+                hideKeyboard();
+                setTvKeyboardBarVisible(false);
             }
         }
+    }
+
+    private void setTvKeyboardBarVisible(boolean visible) {
+        runOnUiThread(() -> {
+            if (tvKeyboardBar != null) {
+                tvKeyboardBar.setVisibility(View.VISIBLE);
+            }
+        });
     }
 
     /**
@@ -1788,6 +3477,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         if (tvTextField == null) {
             return;
         }
+        setTvKeyboardBarVisible(true);
         tvTextField.requestFocus();
         // In landscape the bar sits below the controls inside a ScrollView. Make sure
         // focusing it from an on-screen text field brings it into view before the IME
@@ -1840,6 +3530,12 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
         clickHaptic(trackpad);
         if (service.isBoxActive() && !service.isBoxMouseConnected()) {
+            String savedMac = SecureStore.getBoxBtMac(this);
+            if (savedMac != null && !savedMac.isEmpty() && service.getBoxMouse() != null) {
+                toast("Connecting mouse to TV box...");
+                service.getBoxMouse().autoConnect();
+                return;
+            }
             showBluetoothMousePairDialog();
             return;
         }
@@ -1855,9 +3551,72 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
 
+        // Request discoverability immediately so Android TV sees "LG Remote Mouse" right away
+        BoxBluetoothMouse.requestDiscoverable(this);
+
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = sheet(dialog, "Pair Android TV Mouse");
+
+        TextView info = Ui.text(this,
+                "1. Keep TV on 'Searching for accessories'.\n"
+                + "2. Tap your TV box below to initiate pairing.\n"
+                + "3. Accept 'Pair' on your TV screen.",
+                12, getColor(R.color.muted), Typeface.NORMAL);
+        info.setPadding(0, dp(4), 0, dp(12));
+        panel.addView(info);
+
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout list = Ui.column(this);
+        scroll.addView(list, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        panel.addView(scroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(190)));
+
+        TextView status = Ui.text(this, "Scanning for nearby devices...", 12, getColor(R.color.muted), Typeface.NORMAL);
+        status.setPadding(dp(4), dp(4), dp(4), dp(8));
+        list.addView(status);
+
         List<BluetoothDevice> deviceList = new ArrayList<>();
-        List<String> displayList = new ArrayList<>();
-        ArrayAdapter<String> listAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1, displayList);
+
+        Runnable[] renderItems = new Runnable[1];
+        renderItems[0] = () -> {
+            list.removeAllViews();
+            if (deviceList.isEmpty()) {
+                list.addView(status);
+                return;
+            }
+            for (BluetoothDevice dev : deviceList) {
+                int bond = BluetoothDevice.BOND_NONE;
+                String name = null;
+                try {
+                    bond = dev.getBondState();
+                    name = dev.getName();
+                } catch (SecurityException ignored) {
+                }
+                boolean isBonded = bond == BluetoothDevice.BOND_BONDED;
+                String title = (name != null ? name : dev.getAddress());
+                String sub = isBonded ? "Paired" : dev.getAddress();
+                View row = buildOptionCard(isBonded ? R.drawable.ic_tv : R.drawable.ic_input,
+                        title, sub, isBonded, () -> {
+                            if (isBonded) {
+                                if (service != null && service.getBoxMouse() != null) {
+                                    service.getBoxMouse().connectWithRetry(dev);
+                                    toast("Connecting mouse to " + title + "...");
+                                }
+                                dialog.dismiss();
+                            } else {
+                                try {
+                                    SecureStore.setBoxBtMac(MainActivity.this, dev.getAddress());
+                                    dev.createBond();
+                                    toast("Pairing request sent! Accept prompt on your TV screen...");
+                                } catch (SecurityException e) {
+                                    toast("Pairing failed: " + e.getMessage());
+                                }
+                            }
+                        });
+                list.addView(row);
+            }
+        };
 
         // Pre-populate already bonded devices
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
@@ -1865,19 +3624,12 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 for (BluetoothDevice dev : bt.getBondedDevices()) {
                     if (dev != null && !deviceList.contains(dev)) {
                         deviceList.add(dev);
-                        String name = dev.getName();
-                        displayList.add("📺 " + (name != null ? name : dev.getAddress()) + " (Paired)");
                     }
                 }
             } catch (SecurityException ignored) {
             }
         }
-        if (displayList.isEmpty()) {
-            displayList.add("Scanning for nearby devices...");
-        }
-        listAdapter.notifyDataSetChanged();
-
-        AlertDialog[] dialogHolder = new AlertDialog[1];
+        renderItems[0].run();
 
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
@@ -1886,34 +3638,26 @@ public final class MainActivity extends Activity implements RemoteService.Listen
                 if (BluetoothDevice.ACTION_FOUND.equals(action)) {
                     BluetoothDevice dev = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
                     if (dev != null && !deviceList.contains(dev)) {
-                        if (displayList.size() == 1 && "Scanning for nearby devices...".equals(displayList.get(0))) {
-                            displayList.clear();
-                        }
                         deviceList.add(dev);
-                        String name = null;
-                        try {
-                            name = dev.getName();
-                        } catch (SecurityException ignored) {
-                        }
-                        displayList.add("🔍 " + (name != null ? name : dev.getAddress()));
-                        listAdapter.notifyDataSetChanged();
+                        renderItems[0].run();
                     }
                 } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(action)) {
                     int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR);
                     if (state == BluetoothDevice.BOND_BONDED) {
                         BluetoothDevice dev = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
                         if (dev != null && service != null && service.getBoxMouse() != null) {
-                            service.getBoxMouse().connect(dev);
                             String name = null;
                             try {
                                 name = dev.getName();
                             } catch (SecurityException ignored) {
                             }
-                            toast("Connected mouse to " + (name != null ? name : dev.getAddress()) + "!");
-                            if (dialogHolder[0] != null) {
-                                dialogHolder[0].dismiss();
-                            }
+                            String displayName = (name != null ? name : dev.getAddress());
+                            toast("Paired! Connecting mouse to " + displayName + "...");
+                            service.getBoxMouse().connectWithRetry(dev);
+                            dialog.dismiss();
                         }
+                    } else {
+                        renderItems[0].run();
                     }
                 }
             }
@@ -1932,71 +3676,28 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             }
         }
 
-        LinearLayout container = new LinearLayout(this);
-        container.setOrientation(LinearLayout.VERTICAL);
-        int pad = (int) (18 * getResources().getDisplayMetrics().density);
-        container.setPadding(pad, pad / 2, pad, pad / 2);
+        LinearLayout actions = Ui.row(this);
+        actions.setPadding(0, dp(12), 0, 0);
 
-        TextView info = new TextView(this);
-        info.setText("Android TV hides phones from its accessory search list.\n\n"
-                + "1. Keep TV on 'Searching for accessories'.\n"
-                + "2. Tap your TV box below.\n"
-                + "3. Accept 'Pair' on your TV screen.");
-        info.setTextColor(getColor(R.color.muted));
-        info.setTextSize(13);
-        info.setLineSpacing(0, 1.25f);
-        info.setPadding(0, 0, 0, pad / 2);
-        container.addView(info);
-
-        ListView listView = new ListView(this);
-        listView.setAdapter(listAdapter);
-        listView.setDividerHeight(1);
-        container.addView(listView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) (220 * getResources().getDisplayMetrics().density)));
-
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("Pair Android TV Mouse")
-                .setView(container)
-                .setPositiveButton("Bluetooth Settings", (d, which) -> {
-                    startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
-                })
-                .setNeutralButton("Make Discoverable", (d, which) -> {
-                    BoxBluetoothMouse.requestDiscoverable(this);
-                })
-                .setNegativeButton(android.R.string.cancel, null)
-                .create();
-
-        dialogHolder[0] = dialog;
-
-        listView.setOnItemClickListener((parent, view, position, id) -> {
-            if (position < 0 || position >= deviceList.size()) {
-                return;
-            }
-            BluetoothDevice target = deviceList.get(position);
-            int bond = BluetoothDevice.BOND_NONE;
-            try {
-                bond = target.getBondState();
-            } catch (SecurityException ignored) {
-            }
-            if (bond == BluetoothDevice.BOND_BONDED) {
-                if (service != null && service.getBoxMouse() != null) {
-                    service.getBoxMouse().connect(target);
-                    String name = null;
-                    try {
-                        name = target.getName();
-                    } catch (SecurityException ignored) {
-                    }
-                    toast("Connecting mouse to " + (name != null ? name : target.getAddress()) + "...");
-                }
-                dialog.dismiss();
-            } else {
-                try {
-                    target.createBond();
-                    toast("Pairing request sent! Accept prompt on your TV screen...");
-                } catch (SecurityException e) {
-                    toast("Pairing failed: " + e.getMessage());
-                }
-            }
+        TextView settingsBtn = settingsRow("BT Settings", false);
+        LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        sp.rightMargin = dp(6);
+        actions.addView(settingsBtn, sp);
+        settingsBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
         });
+
+        TextView discBtn = settingsRow("Discoverable", false);
+        LinearLayout.LayoutParams dpLayout = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        dpLayout.leftMargin = dp(6);
+        actions.addView(discBtn, dpLayout);
+        discBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            BoxBluetoothMouse.requestDiscoverable(this);
+        });
+
+        panel.addView(actions);
 
         dialog.setOnDismissListener(d -> {
             try {
@@ -2009,7 +3710,7 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             }
         });
 
-        dialog.show();
+        showSheet(dialog, panel);
     }
 
     private void ensureBluetoothPermission() {
@@ -2035,6 +3736,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             toast(R.string.tv_not_ready);
             return;
         }
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            service.activeRemote().sendNavigation(name, this::onRemoteAction);
+            return;
+        }
         if ("VOLUMEUP".equals(name) || "VOLUMEDOWN".equals(name) || "MUTE".equals(name)) {
             // Volume, mute and power are always TV controls, even on the box input.
             if (!service.sendLgButton(name)) {
@@ -2048,6 +3754,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     private void sendButtonLong(String name) {
         if (service == null) {
             toast(R.string.tv_not_ready);
+            return;
+        }
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            service.activeRemote().sendNavigationLong(name, this::onRemoteAction);
             return;
         }
         if ("VOLUMEUP".equals(name) || "VOLUMEDOWN".equals(name) || "MUTE".equals(name)) {
@@ -2381,6 +4092,366 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
     }
 
+    private void voiceDictationPressed() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+            return;
+        }
+        clickHaptic(tvTextField);
+        if (inAppRecognizing) {
+            stopInAppRecognition();
+            return;
+        }
+        startInAppRecognition(null);
+    }
+
+    private void startInAppRecognition(View triggerButton) {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            try {
+                Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                intent.putExtra(RecognizerIntent.EXTRA_PROMPT, getString(R.string.voice_listening));
+                startActivityForResult(intent, REQUEST_SPEECH_DICTATION);
+            } catch (ActivityNotFoundException e) {
+                toast("Speech recognition is not available on this phone.");
+            }
+            return;
+        }
+
+        if (inAppRecognizer != null) {
+            try {
+                inAppRecognizer.destroy();
+            } catch (Exception ignored) {
+            }
+        }
+
+        inAppRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+        inAppRecognizing = true;
+        showVoiceActiveHud(0, "Listening...");
+        if (tvTextField != null) {
+            tvTextField.setHint(R.string.voice_listening);
+        }
+
+        inAppRecognizer.setRecognitionListener(new RecognitionListener() {
+            @Override
+            public void onReadyForSpeech(Bundle params) {
+                Log.d(TAG, "SpeechRecognizer: ready for speech");
+            }
+
+            @Override
+            public void onBeginningOfSpeech() {
+                Log.d(TAG, "SpeechRecognizer: beginning of speech");
+            }
+
+            @Override
+            public void onRmsChanged(float rmsdB) {}
+
+            @Override
+            public void onBufferReceived(byte[] buffer) {}
+
+            @Override
+            public void onEndOfSpeech() {
+                Log.d(TAG, "SpeechRecognizer: end of speech");
+            }
+
+            @Override
+            public void onError(int error) {
+                Log.w(TAG, "SpeechRecognizer error: " + error);
+                inAppRecognizing = false;
+                dismissVoiceActiveHud();
+                if (triggerButton != null) {
+                    restoreVoiceButton(triggerButton);
+                }
+                if (tvTextField != null) {
+                    tvTextField.setHint(R.string.tv_keyboard_hint);
+                }
+                if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                    toast("No speech detected. Please speak closer to phone.");
+                }
+            }
+
+            @Override
+            public void onResults(Bundle results) {
+                inAppRecognizing = false;
+                dismissVoiceActiveHud();
+                if (triggerButton != null) {
+                    restoreVoiceButton(triggerButton);
+                }
+                if (tvTextField != null) {
+                    tvTextField.setHint(R.string.tv_keyboard_hint);
+                }
+                ArrayList<String> matches = results != null
+                        ? results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) : null;
+                if (matches != null && !matches.isEmpty()) {
+                    String spoken = matches.get(0);
+                    Log.d(TAG, "SpeechRecognizer results: " + spoken);
+                    boolean box = service != null && service.isBoxActive();
+                    if (!box) {
+                        String fgApp = service != null ? service.getForegroundApp() : null;
+                        if (fgApp != null && fgApp.toLowerCase().contains("youtube")) {
+                            try {
+                                String queryUrl = "https://www.youtube.com/results?search_query="
+                                        + java.net.URLEncoder.encode(spoken, "UTF-8");
+                                service.launchApp("youtube.leanback.v4", queryUrl);
+                                toast("Searching YouTube for \"" + spoken + "\"");
+                                return;
+                            } catch (Exception e) {
+                                Log.w(TAG, "Failed to launch YouTube search", e);
+                            }
+                        }
+                    } else {
+                        String boxApp = AndroidTvRemote.getLastBoxApp();
+                        if (boxApp != null && boxApp.toLowerCase().contains("youtube")) {
+                            try {
+                                String queryUrl = "https://www.youtube.com/results?search_query="
+                                        + java.net.URLEncoder.encode(spoken, "UTF-8");
+                                AndroidTvRemote.openApp(queryUrl);
+                                toast("Searching YouTube for \"" + spoken + "\"");
+                                return;
+                            } catch (Exception e) {
+                                Log.w(TAG, "Failed to launch YouTube search on box", e);
+                            }
+                        }
+                    }
+                    if (tvTextField != null) {
+                        setTvKeyboardBarVisible(true);
+                        tvTextField.setText(spoken);
+                        tvTextField.setSelection(spoken.length());
+                        sendTvText(true);
+                    }
+                }
+            }
+
+            @Override
+            public void onPartialResults(Bundle partialResults) {
+                ArrayList<String> matches = partialResults != null
+                        ? partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) : null;
+                if (matches != null && !matches.isEmpty() && tvTextField != null) {
+                    tvTextField.setText(matches.get(0));
+                }
+            }
+
+            @Override
+            public void onEvent(int eventType, Bundle params) {}
+        });
+
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        inAppRecognizer.startListening(intent);
+    }
+
+    private void stopInAppRecognition() {
+        if (inAppRecognizer != null) {
+            try {
+                inAppRecognizer.stopListening();
+            } catch (Exception ignored) {
+            }
+        }
+        inAppRecognizing = false;
+        dismissVoiceActiveHud();
+        if (tvTextField != null) {
+            tvTextField.setHint(R.string.tv_keyboard_hint);
+        }
+    }
+
+    private long voicePressDownTime;
+
+    private void attachVoicePushToTalk(View button) {
+        button.setOnTouchListener((v, event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    voicePressDownTime = System.currentTimeMillis();
+                    v.setPressed(true);
+                    clickHaptic(v);
+                    if (voiceStreamer.isRecording() || inAppRecognizing) {
+                        stopVoicePushToTalk(v);
+                    } else {
+                        startVoicePushToTalk(v);
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    v.setPressed(false);
+                    long duration = System.currentTimeMillis() - voicePressDownTime;
+                    if (duration >= 400) {
+                        stopVoicePushToTalk(v);
+                    }
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    v.setPressed(false);
+                    stopVoicePushToTalk(v);
+                    return true;
+            }
+            return false;
+        });
+    }
+
+    private void startVoicePushToTalk(View button) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+            return;
+        }
+
+        voiceOriginalBackground = button.getBackground();
+        button.setBackground(Ui.circle(this, getColor(R.color.accent), getColor(R.color.accent)));
+        if (button instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) button;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (child instanceof ImageView) {
+                    ((ImageView) child).setColorFilter(getColor(R.color.on_accent));
+                }
+            }
+        }
+
+        if (AndroidTvRemote.isVoiceSessionActive()) {
+            voiceStreamer.start(new VoiceStreamer.Listener() {
+                @Override
+                public void onStarted() {
+                    Log.d(TAG, "Voice: recording and streaming active");
+                    showVoiceActiveHud(0, "Box Microphone");
+                }
+
+                @Override
+                public void onStopped() {
+                    restoreVoiceButton(button);
+                    dismissVoiceActiveHud();
+                }
+
+                @Override
+                public void onError(String message) {
+                    restoreVoiceButton(button);
+                    dismissVoiceActiveHud();
+                    toast(message);
+                }
+            });
+            return;
+        }
+
+        startInAppRecognition(button);
+    }
+
+    private void stopVoicePushToTalk(View button) {
+        if (voiceStreamer.isRecording()) {
+            voiceStreamer.stop();
+        }
+        if (inAppRecognizing) {
+            stopInAppRecognition();
+        }
+        restoreVoiceButton(button);
+        dismissVoiceActiveHud();
+    }
+
+    private void restoreVoiceButton(View button) {
+        runOnUiThread(() -> {
+            if (voiceOriginalBackground != null) {
+                button.setBackground(voiceOriginalBackground);
+            }
+            if (button instanceof ViewGroup) {
+                ViewGroup group = (ViewGroup) button;
+                for (int i = 0; i < group.getChildCount(); i++) {
+                    View child = group.getChildAt(i);
+                    if (child instanceof ImageView) {
+                        ((ImageView) child).setColorFilter(getColor(R.color.text));
+                    }
+                }
+            }
+        });
+    }
+
+    @Override
+    public void onIncomingVoiceSession(int sessionId, String packageName) {
+        Log.d(TAG, "MainActivity: onIncomingVoiceSession id=" + sessionId + " pkg=" + packageName);
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQUEST_RECORD_AUDIO);
+            return;
+        }
+        clickHaptic(remoteView);
+        showVoiceActiveHud(sessionId, packageName);
+        voiceStreamer.startForIncomingSession(sessionId, new VoiceStreamer.Listener() {
+            @Override
+            public void onStarted() {
+                Log.d(TAG, "Auto Voice: recording and streaming active for TV (" + packageName + ")");
+            }
+
+            @Override
+            public void onStopped() {
+                dismissVoiceActiveHud();
+            }
+
+            @Override
+            public void onError(String message) {
+                dismissVoiceActiveHud();
+                toast(message);
+            }
+        });
+    }
+
+    @Override
+    public void onVoiceSessionEnded(int sessionId) {
+        Log.d(TAG, "MainActivity: onVoiceSessionEnded id=" + sessionId);
+        if (voiceStreamer.isRecording()) {
+            voiceStreamer.stop();
+        }
+        dismissVoiceActiveHud();
+    }
+
+    private void showVoiceActiveHud(int sessionId, String packageName) {
+        runOnUiThread(() -> {
+            String app = (packageName != null && !packageName.isEmpty()) ? packageName : "TV";
+            if (app.contains(".")) {
+                app = app.substring(app.lastIndexOf('.') + 1);
+            }
+            tintBanner(getColor(R.color.accent));
+            showBanner("🎙️ " + getString(R.string.voice_listening) + " · " + app,
+                    getString(R.string.voice_done), () -> {
+                        clickHaptic(banner);
+                        if (voiceStreamer.isRecording()) {
+                            voiceStreamer.stop();
+                        }
+                        dismissVoiceActiveHud();
+                    });
+        });
+    }
+
+    private void dismissVoiceActiveHud() {
+        runOnUiThread(() -> {
+            hideBanner();
+        });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_RECORD_AUDIO) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                toast("Microphone enabled. Hold the Voice button to speak.");
+            } else {
+                toast(getString(R.string.voice_permission_needed));
+            }
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_SPEECH_DICTATION && resultCode == RESULT_OK && data != null) {
+            ArrayList<String> matches = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if (matches != null && !matches.isEmpty()) {
+                String spokenText = matches.get(0);
+                if (tvTextField != null) {
+                    tvTextField.setText(spokenText);
+                    tvTextField.setSelection(spokenText.length());
+                    sendTvText();
+                }
+            }
+        }
+    }
+
     private void showBoxSetupPrompt() {
         new AlertDialog.Builder(this)
                 .setTitle(R.string.box_setup_title)
@@ -2399,29 +4470,56 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             // The old certificate/session must not stay live while a new pairing code is issued.
             service.stopBoxSession();
         }
-        String saved = SecureStore.getBoxHost(this);
-        if (saved != null && !saved.isEmpty()) {
-            // Try the known address first. It avoids depending on mDNS and keeps re-pairing quick.
-            startBoxPairing(saved, true);
-            return;
-        }
         discoverBoxForPairing();
     }
 
     private void discoverBoxForPairing() {
         showBoxProgress(R.string.box_finding);
-        AndroidTvRemote.discover(this, (host, error) -> {
+        AndroidTvRemote.discoverAll(this, boxes -> {
             dismissBoxProgress();
             if (isFinishing() || isDestroyed()) {
                 return;
             }
-            if (host == null) {
-                toast(error == null ? getString(R.string.box_not_found) : error);
+            if (boxes == null || boxes.isEmpty()) {
+                toast(getString(R.string.box_not_found));
                 showBoxIpDialog();
                 return;
             }
-            startBoxPairing(host, false);
+
+            AndroidTvRemote.DiscoveredBox matched = findBoxMatchingTvInput(boxes);
+            if (matched != null) {
+                Log.d(TAG, "Pairing targeting box matching TV input: " + matched.name + " (" + matched.host + ")");
+                startBoxPairing(matched.host, false);
+                return;
+            }
+
+            if (boxes.size() == 1 && SecureStore.getDeviceMode(this) == SecureStore.MODE_ANDROID_TV) {
+                startBoxPairing(boxes.get(0).host, false);
+                return;
+            }
+
+            showBoxSelectionDialog(boxes);
         });
+    }
+
+    private void showBoxSelectionDialog(List<AndroidTvRemote.DiscoveredBox> boxes) {
+        CharSequence[] items = new CharSequence[boxes.size()];
+        for (int i = 0; i < boxes.size(); i++) {
+            AndroidTvRemote.DiscoveredBox b = boxes.get(i);
+            String matched = getMatchingTvInputLabel(b);
+            String label = (b.name != null ? b.name : "Android TV") + " (" + b.host + ")";
+            if (matched != null) {
+                label += " [TV Input: " + matched + "]";
+            }
+            items[i] = label;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.box_setup_title)
+                .setItems(items, (dialog, which) -> {
+                    startBoxPairing(boxes.get(which).host, false);
+                })
+                .setNegativeButton(R.string.cancel, null)
+                .show();
     }
 
     private void showBoxIpDialog() {
@@ -2438,6 +4536,13 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         String saved = SecureStore.getBoxHost(this);
         if (saved != null && !saved.isEmpty()) {
             address.setText(saved);
+        } else {
+            String tvIp = service != null ? service.getIp() : SecureStore.getSavedIp(this);
+            if (tvIp != null && tvIp.contains(".")) {
+                String prefix = tvIp.substring(0, tvIp.lastIndexOf('.') + 1);
+                address.setText(prefix);
+                address.setSelection(address.length());
+            }
         }
         AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(R.string.box_ip_title)
@@ -2538,7 +4643,11 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             }
             if (ok) {
                 toast(R.string.box_paired);
-                if (service != null && service.isConnected()) {
+                int mode = SecureStore.getDeviceMode(MainActivity.this);
+                if (mode == SecureStore.MODE_ANDROID_TV) {
+                    RemoteService.start(MainActivity.this, null, null);
+                    showRemote();
+                } else if (service != null && service.isConnected()) {
                     service.linkBoxToActiveInput();
                     if (service.isBoxActive()) {
                         homePressed();
@@ -2577,42 +4686,67 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     }
 
     private void showBoxOptions(Dialog settings) {
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.box_section)
-                .setItems(new String[]{
-                        getString(R.string.wake_box_cec),
-                        "Pair / Connect Bluetooth Mouse",
-                        getString(R.string.box_pair_again),
-                        getString(R.string.forget_pairing)}, (dialog, which) -> {
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = sheet(dialog, getString(R.string.box_section));
+
+        panel.addView(buildOptionCard(R.drawable.ic_power, getString(R.string.wake_box_cec),
+                "Switch TV input to Android TV box", false, () -> {
+                    dialog.dismiss();
                     settings.dismiss();
-                    if (which == 0) {
-                        wakeBoxCec(true);
-                    } else if (which == 1) {
-                        showBluetoothMousePairDialog();
-                    } else if (which == 2) {
-                        beginBoxPairing();
-                    } else {
-                        confirmForgetBox();
-                    }
-                })
-                .show();
+                    wakeBoxCec(true);
+                }));
+
+        boolean mouseConnected = service != null && service.isBoxMouseConnected();
+        String mouseSub = mouseConnected
+                ? "Connected (" + service.getBoxMouse().getConnectedDeviceName() + ")"
+                : "Required for native cursor on TV box";
+        panel.addView(buildOptionCard(R.drawable.ic_input, "Pair / Connect Bluetooth Mouse",
+                mouseSub, mouseConnected, () -> {
+                    dialog.dismiss();
+                    settings.dismiss();
+                    showBluetoothMousePairDialog();
+                }));
+
+        panel.addView(buildOptionCard(R.drawable.ic_gear, getString(R.string.box_pair_again),
+                "Re-pair network remote over TLS", false, () -> {
+                    dialog.dismiss();
+                    settings.dismiss();
+                    beginBoxPairing();
+                }));
+
+        panel.addView(buildOptionCard(R.drawable.ic_close, getString(R.string.forget_pairing),
+                "Clear paired Android TV configuration", false, () -> {
+                    dialog.dismiss();
+                    settings.dismiss();
+                    confirmForgetBox();
+                }));
+
+        showSheet(dialog, panel);
     }
 
     private void confirmForgetBox() {
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.box_forget_title)
-                .setMessage(R.string.box_forget_body)
-                .setPositiveButton(R.string.box_forget_confirm, (dialog, which) -> {
-                    cancelBoxPairing();
-                    if (service != null) {
-                        service.stopBoxSession();
-                    }
-                    AndroidTvRemote.forget(this);
-                    renderConnection();
-                    toast(R.string.box_forgotten);
-                })
-                .setNegativeButton(R.string.cancel, null)
-                .show();
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = sheet(dialog, getString(R.string.box_forget_title));
+
+        TextView msg = Ui.text(this, getString(R.string.box_forget_body), 13, getColor(R.color.muted), Typeface.NORMAL);
+        msg.setPadding(0, dp(4), 0, dp(14));
+        panel.addView(msg);
+
+        TextView forgetBtn = settingsRow(getString(R.string.box_forget_confirm), true);
+        panel.addView(forgetBtn);
+        forgetBtn.setOnClickListener(v -> {
+            clickHaptic(v);
+            dialog.dismiss();
+            cancelBoxPairing();
+            if (service != null) {
+                service.stopBoxSession();
+            }
+            AndroidTvRemote.forget(this);
+            renderConnection();
+            toast(R.string.box_forgotten);
+        });
+
+        showSheet(dialog, panel);
     }
 
     private String boxInputLabel() {
@@ -2636,31 +4770,43 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             toast(R.string.box_input_loading);
             return;
         }
-        String[] labels = new String[inputs.size() + 1];
-        for (int i = 0; i < inputs.size(); i++) {
-            LgTvClient.TvInput input = inputs.get(i);
-            labels[i] = input.label;
+        Dialog dialog = new Dialog(this);
+        LinearLayout panel = sheet(dialog, getString(R.string.box_input_title));
+        String currentId = SecureStore.getBoxInputId(this);
+
+        for (LgTvClient.TvInput in : inputs) {
+            boolean selected = currentId != null && currentId.equals(in.id);
+            panel.addView(buildOptionCard(R.drawable.ic_input, in.label, in.id, selected, () -> {
+                dialog.dismiss();
+                service.linkBoxInput(in.id);
+                toast(getString(R.string.box_input_linked, in.label));
+                if (row != null) {
+                    row.setText(boxInputLabel());
+                }
+            }));
         }
-        labels[inputs.size()] = getString(R.string.box_input_clear);
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.box_input_title)
-                .setItems(labels, (dialog, which) -> {
-                    if (which == inputs.size()) {
-                        SecureStore.setBoxInput(this, "", "");
-                        toast(R.string.box_input_cleared);
-                    } else {
-                        LgTvClient.TvInput input = inputs.get(which);
-                        service.linkBoxInput(input.id);
-                        toast(getString(R.string.box_input_linked, input.label));
-                    }
+
+        panel.addView(buildOptionCard(R.drawable.ic_close, getString(R.string.box_input_clear),
+                "Unlink box from TV HDMI inputs", false, () -> {
+                    dialog.dismiss();
+                    SecureStore.setBoxInput(this, "", "");
+                    toast(R.string.box_input_cleared);
                     if (row != null) {
                         row.setText(boxInputLabel());
                     }
-                })
-                .show();
+                }));
+
+        showSheet(dialog, panel);
     }
 
     private void powerPressed() {
+        int mode = SecureStore.getDeviceMode(this);
+        if (mode == SecureStore.MODE_ANDROID_TV) {
+            if (service != null) {
+                service.activeRemote().sendNavigation("POWER", this::onRemoteAction);
+            }
+            return;
+        }
         if (service != null && service.isConnected()) {
             if (service.isTvOff()) {
                 wakeTv();
@@ -2763,6 +4909,38 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         scroll.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, Math.max(dp(300), height)));
         panel.addView(scroll);
+
+        content.addView(Ui.label(this, getString(R.string.choose_remote_mode)));
+        LinearLayout modeRow = Ui.row(this);
+        LinearLayout.LayoutParams modeRowParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(38));
+        modeRowParams.topMargin = dp(8);
+        modeRowParams.bottomMargin = dp(16);
+        content.addView(modeRow, modeRowParams);
+
+        int currentMode = SecureStore.getDeviceMode(this);
+        TextView optBoth = pill(getString(R.string.mode_unified), currentMode == SecureStore.MODE_AUTO);
+        TextView optBox = pill(getString(R.string.mode_android_tv), currentMode == SecureStore.MODE_ANDROID_TV);
+        TextView optLg = pill(getString(R.string.mode_lg_tv), currentMode == SecureStore.MODE_LG_TV);
+        modeRow.addView(optBoth, weighted(1f, 38, 0, 4));
+        modeRow.addView(optBox, weighted(1f, 38, 0, 4));
+        modeRow.addView(optLg, weighted(1f, 38, 0, 0));
+
+        optBoth.setOnClickListener(v -> {
+            clickHaptic(v);
+            dialog.dismiss();
+            setDeviceModeAndRefresh(SecureStore.MODE_AUTO);
+        });
+        optBox.setOnClickListener(v -> {
+            clickHaptic(v);
+            dialog.dismiss();
+            setDeviceModeAndRefresh(SecureStore.MODE_ANDROID_TV);
+        });
+        optLg.setOnClickListener(v -> {
+            clickHaptic(v);
+            dialog.dismiss();
+            setDeviceModeAndRefresh(SecureStore.MODE_LG_TV);
+        });
 
         content.addView(Ui.label(this, getString(R.string.current_tv)));
         String ip = service != null ? service.getIp() : SecureStore.getSavedIp(this);
@@ -3378,66 +5556,68 @@ public final class MainActivity extends Activity implements RemoteService.Listen
     }
 
     private void showApps() {
-        if (service == null || !service.isConnected()) {
-            toast(R.string.tv_not_ready);
-            return;
-        }
         dismiss(appsDialog);
         Dialog dialog = new Dialog(this);
         appsDialog = dialog;
-        boolean boxActive = service.isBoxActive();
-        // This list always belongs to the LG TV. Opening an app from here is the quick way back
-        // to the TV's apps while the Android TV box input is active.
-        LinearLayout panel = sheet(dialog, getString(boxActive
-                ? R.string.open_tv_apps_title : R.string.open_app_title));
-        appsStatus = Ui.text(this, getString(boxActive
-                ? R.string.loading_tv_apps : R.string.loading_apps), 12,
+        LinearLayout panel = sheet(dialog, "Apps & Channels");
+        appsStatus = Ui.text(this, "Loading installed apps...", 12,
                 getColor(R.color.muted), Typeface.NORMAL);
         appsStatus.setGravity(Gravity.CENTER);
         panel.addView(appsStatus);
+
         ScrollView scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
-        int height = Math.min(dp(430), getResources().getDisplayMetrics().heightPixels / 2);
+        int height = Math.min(dp(460), getResources().getDisplayMetrics().heightPixels / 2);
         scroll.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, height));
         appsList = Ui.column(this);
         scroll.addView(appsList, new ScrollView.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         panel.addView(scroll);
-        if (!service.getApps().isEmpty()) {
-            populateApps(service.getApps());
-        }
+
+        populateApps(service != null ? service.getApps() : null);
         showSheet(dialog, panel);
-        service.requestApps();
+        if (service != null && service.isConnected()) {
+            service.requestApps();
+        }
     }
 
-    private void populateApps(List<LgTvClient.TvApp> apps) {
+    private void populateApps(List<LgTvClient.TvApp> lgApps) {
         if (appsList == null) {
             return;
         }
         appsList.removeAllViews();
-        if (service != null && service.isBoxActive()) {
-            appsList.addView(lgHomeRow());
-        }
-        if (apps == null || apps.isEmpty()) {
-            if (appsStatus != null) {
-                appsStatus.setText(R.string.no_apps);
-                appsStatus.setVisibility(service != null && service.isBoxActive() ? View.GONE : View.VISIBLE);
-            }
-            return;
-        }
         if (appsStatus != null) {
             appsStatus.setVisibility(View.GONE);
         }
-        for (LgTvClient.TvApp app : apps) {
-            appsList.addView(appRow(app));
+
+        appsList.addView(buildAppCard(R.drawable.ic_home, null, getString(R.string.lg_home), "webOS Home Dashboard", false, () -> {
+            dismiss(appsDialog);
+            lgHomePressed();
+        }));
+
+        if (lgApps != null && !lgApps.isEmpty()) {
+            for (LgTvClient.TvApp app : lgApps) {
+                appsList.addView(buildAppCard(0, null, app.title, app.id, false, () -> {
+                    dismiss(appsDialog);
+                    if (service != null) {
+                        service.launchApp(app.id);
+                    }
+                    toast(getString(R.string.opening_app, app.title));
+                }));
+            }
         }
     }
 
-    private View lgHomeRow() {
+    private View buildAppCard(int iconRes, String letter, String title, String subtitle, boolean isBox, Runnable onClick) {
+        return buildAppCard(iconRes, letter, title, subtitle, isBox, onClick, null);
+    }
+
+    private View buildAppCard(int iconRes, String letter, String title, String subtitle, boolean isBox, Runnable onClick, Runnable onLongClick) {
         LinearLayout row = Ui.row(this);
-        row.setPadding(dp(10), dp(9), dp(10), dp(9));
-        row.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 12,
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14), dp(10), dp(14), dp(10));
+        row.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 14,
                 getColor(R.color.stroke), 1));
         LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -3445,74 +5625,112 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         row.setLayoutParams(rowParams);
         row.setClickable(true);
         row.setFocusable(true);
-        ImageView badge = Ui.icon(this, R.drawable.ic_home, getColor(R.color.accent), 18);
-        badge.setBackground(Ui.round(this, getColor(R.color.accent_dim), 10));
-        row.addView(badge, Ui.dpParams(this, 34, 34));
-        LinearLayout text = Ui.column(this);
+
+        FrameLayout iconBox = new FrameLayout(this);
+        iconBox.setBackground(Ui.circle(this, getColor(R.color.surface), getColor(R.color.stroke)));
+        if (iconRes > 0) {
+            ImageView icon = Ui.icon(this, iconRes, getColor(isBox ? R.color.accent : R.color.text), 18);
+            FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER);
+            iconBox.addView(icon, iconParams);
+        } else {
+            String initial = letter != null && !letter.isEmpty() ? letter
+                    : (title != null && !title.isEmpty() ? title.substring(0, 1).toUpperCase(Locale.US) : "A");
+            TextView txt = Ui.text(this, initial, 13, getColor(R.color.accent), Typeface.BOLD);
+            txt.setGravity(Gravity.CENTER);
+            FrameLayout.LayoutParams txtParams = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER);
+            iconBox.addView(txt, txtParams);
+        }
+        row.addView(iconBox, new LinearLayout.LayoutParams(dp(36), dp(36)));
+
+        LinearLayout textCol = Ui.column(this);
         LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        textParams.leftMargin = dp(10);
-        row.addView(text, textParams);
-        text.addView(Ui.text(this, getString(R.string.lg_home), 14, getColor(R.color.text), Typeface.BOLD));
-        TextView desc = Ui.text(this, getString(R.string.lg_home_desc), 10, getColor(R.color.muted), Typeface.NORMAL);
-        LinearLayout.LayoutParams descParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        descParams.topMargin = dp(2);
-        text.addView(desc, descParams);
+        textParams.leftMargin = dp(12);
+        row.addView(textCol, textParams);
+
+        TextView titleView = Ui.text(this, title != null ? title : "", 14f, getColor(R.color.text), Typeface.BOLD);
+        textCol.addView(titleView);
+
+        if (subtitle != null && !subtitle.isEmpty()) {
+            TextView subView = Ui.text(this, subtitle, 11f, getColor(R.color.muted), Typeface.NORMAL);
+            textCol.addView(subView);
+        }
+
         row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 16));
+
         row.setOnClickListener(v -> {
             clickHaptic(v);
-            dismiss(appsDialog);
-            lgHomePressed();
+            onClick.run();
         });
+        if (onLongClick != null) {
+            row.setOnLongClickListener(v -> {
+                clickHaptic(v);
+                onLongClick.run();
+                return true;
+            });
+        }
         return row;
     }
 
-    private View appRow(LgTvClient.TvApp app) {
+    private View buildInputCard(int iconRes, String title, String subtitle, boolean active, Runnable onClick) {
         LinearLayout row = Ui.row(this);
-        row.setPadding(dp(10), dp(9), dp(10), dp(9));
-        row.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 12,
-                getColor(R.color.stroke), 1));
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(14), dp(12), dp(14), dp(12));
+        row.setBackground(Ui.pressable(this,
+                active ? getColor(R.color.secondary_container) : getColor(R.color.surface_2),
+                16,
+                active ? getColor(R.color.accent) : getColor(R.color.stroke),
+                active ? 1.5f : 1f));
         LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rowParams.bottomMargin = dp(6);
+        rowParams.bottomMargin = dp(8);
         row.setLayoutParams(rowParams);
         row.setClickable(true);
         row.setFocusable(true);
-        TextView badge = Ui.text(this,
-                app.title.substring(0, 1).toUpperCase(Locale.US), 14,
-                getColor(R.color.accent), Typeface.BOLD);
-        badge.setGravity(Gravity.CENTER);
-        badge.setBackground(Ui.round(this, getColor(R.color.accent_dim), 10));
-        row.addView(badge, Ui.dpParams(this, 34, 34));
-        LinearLayout text = Ui.column(this);
+
+        FrameLayout iconBox = new FrameLayout(this);
+        iconBox.setBackground(Ui.circle(this,
+                active ? getColor(R.color.accent_dim) : getColor(R.color.surface),
+                getColor(R.color.stroke)));
+        ImageView icon = Ui.icon(this, iconRes,
+                active ? getColor(R.color.accent) : getColor(R.color.text), 20);
+        FrameLayout.LayoutParams iconParams = new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER);
+        iconBox.addView(icon, iconParams);
+        row.addView(iconBox, new LinearLayout.LayoutParams(dp(40), dp(40)));
+
+        LinearLayout textCol = Ui.column(this);
         LinearLayout.LayoutParams textParams = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        textParams.leftMargin = dp(10);
-        row.addView(text, textParams);
-        text.addView(Ui.text(this, app.title, 14, getColor(R.color.text), Typeface.BOLD));
-        TextView id = Ui.text(this, app.id, 10, getColor(R.color.muted), Typeface.NORMAL);
-        LinearLayout.LayoutParams idParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        idParams.topMargin = dp(2);
-        text.addView(id, idParams);
-        row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 16));
+        textParams.leftMargin = dp(12);
+        row.addView(textCol, textParams);
+
+        TextView titleView = Ui.text(this, title, 14.5f,
+                active ? getColor(R.color.accent) : getColor(R.color.text), Typeface.BOLD);
+        textCol.addView(titleView);
+
+        if (subtitle != null && !subtitle.isEmpty()) {
+            TextView subView = Ui.text(this, subtitle, 11.5f, getColor(R.color.muted), Typeface.NORMAL);
+            textCol.addView(subView);
+        }
+
+        if (active) {
+            TextView badge = Ui.text(this, "ACTIVE", 10f, getColor(R.color.on_accent), Typeface.BOLD);
+            badge.setPadding(dp(8), dp(3), dp(8), dp(3));
+            badge.setBackground(Ui.round(this, getColor(R.color.green), 99));
+            row.addView(badge);
+        } else {
+            row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 16));
+        }
+
         row.setOnClickListener(v -> {
             clickHaptic(v);
-            service.launchApp(app.id);
-            toast(getString(R.string.opening_app, app.title));
-            if (appsDialog != null) {
-                appsDialog.dismiss();
-            }
+            onClick.run();
         });
         return row;
     }
 
     private void showInputs() {
-        if (service == null || !service.isConnected()) {
-            toast(R.string.tv_not_ready);
-            return;
-        }
         dismiss(inputsDialog);
         Dialog dialog = new Dialog(this);
         inputsDialog = dialog;
@@ -3520,15 +5738,16 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         inputsStatus = Ui.text(this, getString(R.string.loading_inputs), 12,
                 getColor(R.color.muted), Typeface.NORMAL);
         inputsStatus.setGravity(Gravity.CENTER);
+        inputsStatus.setVisibility(View.GONE);
         panel.addView(inputsStatus);
         LinearLayout list = Ui.column(this);
         inputsList = list;
         panel.addView(list);
-        if (!service.getInputs().isEmpty()) {
-            populateInputs(service.getInputs());
-        }
+        populateInputs(service != null ? service.getInputs() : null);
         showSheet(dialog, panel);
-        service.requestInputs();
+        if (service != null && service.isConnected()) {
+            service.requestInputs();
+        }
     }
 
     private void populateInputs(List<LgTvClient.TvInput> inputs) {
@@ -3536,51 +5755,98 @@ public final class MainActivity extends Activity implements RemoteService.Listen
             return;
         }
         inputsList.removeAllViews();
-        if (inputs == null || inputs.isEmpty()) {
-            if (inputsStatus != null) {
-                inputsStatus.setText(R.string.no_inputs);
-                inputsStatus.setVisibility(View.VISIBLE);
+
+        HorizontalScrollView scroll = new HorizontalScrollView(this);
+        scroll.setHorizontalScrollBarEnabled(false);
+        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+
+        LinearLayout row = Ui.row(this);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(4), dp(8), dp(4), dp(8));
+        scroll.addView(row, new HorizontalScrollView.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LgTvClient.TvInput activeInput = service != null ? service.getActiveInput() : null;
+        String fgApp = service != null ? service.getForegroundApp() : "";
+
+        // 1. Live TV Tile
+        boolean isLiveTv = fgApp != null && fgApp.contains("livetv");
+        row.addView(buildInputCircleTile(R.drawable.ic_tv, "Live TV", isLiveTv, () -> {
+            if (service != null) service.launchApp("com.webos.app.livetv");
+            toast(getString(R.string.switching_input, "Live TV"));
+            if (inputsDialog != null) inputsDialog.dismiss();
+        }));
+
+        // 2. HDMI Inputs
+        if (inputs != null && !inputs.isEmpty()) {
+            for (LgTvClient.TvInput input : inputs) {
+                boolean isActive = activeInput != null && (
+                        (input.id != null && input.id.equalsIgnoreCase(activeInput.id))
+                        || (input.appId != null && input.appId.equalsIgnoreCase(activeInput.appId)));
+                row.addView(buildInputCircleTile(R.drawable.ic_input, input.label, isActive, () -> {
+                    if (service != null) service.switchInput(input.id);
+                    toast(getString(R.string.switching_input, input.label));
+                    if (inputsDialog != null) inputsDialog.dismiss();
+                }));
             }
-            return;
-        }
-        if (inputsStatus != null) {
-            inputsStatus.setVisibility(View.GONE);
-        }
-        for (LgTvClient.TvInput input : inputs) {
-            LinearLayout row = Ui.row(this);
-            row.setPadding(dp(14), dp(13), dp(14), dp(13));
-            row.setBackground(Ui.pressable(this, getColor(R.color.surface_2), 12,
-                    getColor(R.color.stroke), 1));
-            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            rowParams.bottomMargin = dp(6);
-            row.setLayoutParams(rowParams);
-            row.setClickable(true);
-            row.setFocusable(true);
-            View dot = new View(this);
-            dot.setBackground(Ui.round(this, input.connected ? getColor(R.color.green)
-                    : getColor(R.color.stroke), 99));
-            LinearLayout.LayoutParams dotParams = Ui.dpParams(this, 8, 8);
-            dotParams.rightMargin = dp(10);
-            row.addView(dot, dotParams);
-            TextView label = Ui.text(this, input.label, 14, getColor(R.color.text), Typeface.BOLD);
-            row.addView(label, new LinearLayout.LayoutParams(0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            if (input.connected) {
-                row.addView(Ui.text(this, getString(R.string.connected_input), 10,
-                        getColor(R.color.green), Typeface.BOLD));
+        } else {
+            for (int i = 1; i <= 4; i++) {
+                final int port = i;
+                final String id = "HDMI_" + port;
+                final String label = "HDMI " + port;
+                boolean isActive = activeInput != null && id.equalsIgnoreCase(activeInput.id);
+                row.addView(buildInputCircleTile(R.drawable.ic_input, label, isActive, () -> {
+                    if (service != null) service.switchInput(id);
+                    toast(getString(R.string.switching_input, label));
+                    if (inputsDialog != null) inputsDialog.dismiss();
+                }));
             }
-            row.addView(Ui.icon(this, R.drawable.ic_chevron, getColor(R.color.muted), 16));
-            row.setOnClickListener(v -> {
-                clickHaptic(v);
-                service.switchInput(input.id);
-                toast(getString(R.string.switching_input, input.label));
-                if (inputsDialog != null) {
-                    inputsDialog.dismiss();
-                }
-            });
-            inputsList.addView(row);
         }
+
+        // 3. LG Home Dashboard Tile
+        boolean isHome = (fgApp == null || fgApp.isEmpty() || fgApp.contains("home"));
+        row.addView(buildInputCircleTile(R.drawable.ic_home, "LG Home", isHome, () -> {
+            lgHomePressed();
+            if (inputsDialog != null) inputsDialog.dismiss();
+        }));
+
+        inputsList.addView(scroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+    }
+
+    private View buildInputCircleTile(int iconRes, String label, boolean active, Runnable onClick) {
+        LinearLayout col = Ui.column(this);
+        col.setGravity(Gravity.CENTER_HORIZONTAL);
+        col.setPadding(dp(8), dp(4), dp(8), dp(4));
+
+        FrameLayout circle = new FrameLayout(this);
+        circle.setBackground(Ui.circle(this,
+                active ? getColor(R.color.accent_dim) : getColor(R.color.surface_2),
+                active ? getColor(R.color.accent) : getColor(R.color.stroke)));
+        ImageView icon = Ui.icon(this, iconRes,
+                active ? getColor(R.color.accent) : getColor(R.color.text), 26);
+        circle.addView(icon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+
+        circle.setOnClickListener(v -> {
+            clickHaptic(v);
+            onClick.run();
+        });
+
+        col.addView(circle, new LinearLayout.LayoutParams(dp(64), dp(64)));
+
+        TextView tv = Ui.text(this, label, 11.5f,
+                active ? getColor(R.color.accent) : getColor(R.color.muted), Typeface.BOLD);
+        tv.setSingleLine(true);
+        tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        tv.setMaxWidth(dp(76));
+        tv.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tp.topMargin = dp(8);
+        col.addView(tv, tp);
+
+        return col;
     }
 
     private LinearLayout sheet(Dialog dialog, String title) {
@@ -3768,11 +6034,42 @@ public final class MainActivity extends Activity implements RemoteService.Listen
         }
     }
 
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            View focus = getCurrentFocus();
+            if (focus instanceof EditText) {
+                Rect rect = new Rect();
+                View target = (focus == tvTextField && tvKeyboardBar != null) ? tvKeyboardBar : focus;
+                target.getGlobalVisibleRect(rect);
+                if (!rect.contains((int) ev.getRawX(), (int) ev.getRawY())) {
+                    hideKeyboard();
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
     private void hideKeyboard() {
         InputMethodManager manager = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-        View focus = getCurrentFocus();
-        if (manager != null && focus != null) {
-            manager.hideSoftInputFromWindow(focus.getWindowToken(), 0);
+        if (manager != null) {
+            View focus = getCurrentFocus();
+            IBinder token = focus != null ? focus.getWindowToken() : null;
+            if (token == null && tvTextField != null) {
+                token = tvTextField.getWindowToken();
+            }
+            if (token == null && remoteView != null) {
+                token = remoteView.getWindowToken();
+            }
+            if (token == null && getWindow() != null && getWindow().getDecorView() != null) {
+                token = getWindow().getDecorView().getWindowToken();
+            }
+            if (token != null) {
+                manager.hideSoftInputFromWindow(token, 0);
+            }
+        }
+        if (tvTextField != null && tvTextField.hasFocus()) {
+            tvTextField.clearFocus();
         }
     }
 

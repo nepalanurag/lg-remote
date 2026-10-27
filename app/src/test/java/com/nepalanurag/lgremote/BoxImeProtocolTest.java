@@ -1,5 +1,6 @@
 package com.nepalanurag.lgremote;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -248,6 +249,55 @@ public class BoxImeProtocolTest {
         assertEquals(615, info.features);
         // 615 includes the IME feature, which is what makes text entry possible.
         assertTrue((info.features & 4) != 0);
+    }
+
+    @Test
+    public void voiceBeginIsSentAsFieldThirtyWithSessionId() throws IOException {
+        byte[] message = AndroidTvRemote.remoteVoiceBegin(42);
+        byte[] voice = field(message, 30);
+        assertNotNull("the voice begin must be wrapped in field 30", voice);
+        assertEquals(42, varint(voice, 1));
+    }
+
+    @Test
+    public void voicePayloadIsSentAsFieldThirtyOneWithSessionIdAndSamples() throws IOException {
+        byte[] samples = new byte[]{1, 2, 3, 4};
+        byte[] message = AndroidTvRemote.remoteVoicePayload(42, samples);
+        byte[] payload = field(message, 31);
+        assertNotNull("the voice payload must be wrapped in field 31", payload);
+        assertEquals(42, varint(payload, 1));
+        assertArrayEquals(samples, field(payload, 2));
+    }
+
+    @Test
+    public void voiceEndIsSentAsFieldThirtyTwoWithSessionId() throws IOException {
+        byte[] message = AndroidTvRemote.remoteVoiceEnd(42);
+        byte[] voice = field(message, 32);
+        assertNotNull("the voice end must be wrapped in field 32", voice);
+        assertEquals(42, varint(voice, 1));
+    }
+
+    @Test
+    public void parseRemoteDecodesVoiceBeginAndEnd() throws IOException {
+        Writer beginWriter = new Writer();
+        beginWriter.varint(1, 99);
+        beginWriter.string(2, "com.google.android.katniss");
+        Writer msg1 = new Writer();
+        msg1.bytes(30, beginWriter.bytes());
+
+        RemoteInfo beginInfo = AndroidTvRemote.parseRemote(msg1.bytes());
+        assertTrue(beginInfo.voiceBegin);
+        assertEquals(99, beginInfo.voiceSessionId);
+        assertEquals("com.google.android.katniss", beginInfo.voicePackage);
+
+        Writer endWriter = new Writer();
+        endWriter.varint(1, 99);
+        Writer msg2 = new Writer();
+        msg2.bytes(32, endWriter.bytes());
+
+        RemoteInfo endInfo = AndroidTvRemote.parseRemote(msg2.bytes());
+        assertTrue(endInfo.voiceEnd);
+        assertEquals(99, endInfo.voiceSessionId);
     }
 
     // ------------------------------------------------------------------ helpers

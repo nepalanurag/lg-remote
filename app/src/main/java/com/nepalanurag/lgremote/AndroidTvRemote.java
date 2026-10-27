@@ -69,14 +69,20 @@ public final class AndroidTvRemote {
     private static final int FEATURE_PING = 1;
     private static final int FEATURE_KEY = 2;
     private static final int FEATURE_IME = 4;
+    private static final int FEATURE_VOICE = 8;
     private static final int FEATURE_POWER = 32;
     private static final int FEATURE_VOLUME = 64;
     private static final int FEATURE_APP_LINK = 512;
     private static final int REQUESTED_FEATURES =
-            FEATURE_PING | FEATURE_KEY | FEATURE_IME | FEATURE_POWER | FEATURE_VOLUME
+            FEATURE_PING | FEATURE_KEY | FEATURE_IME | FEATURE_VOICE | FEATURE_POWER | FEATURE_VOLUME
                     | FEATURE_APP_LINK;
     static final int KEYCODE_HOME = 3;
     private static final int KEYCODE_BACK = 4;
+    public static final int KEYCODE_VOLUME_UP = 24;
+    public static final int KEYCODE_VOLUME_DOWN = 25;
+    public static final int KEYCODE_POWER = 26;
+    public static final int KEYCODE_SEARCH = 84;
+    public static final int KEYCODE_VOLUME_MUTE = 164;
     private static final int KEYCODE_DPAD_UP = 19;
     private static final int KEYCODE_DPAD_DOWN = 20;
     private static final int KEYCODE_DPAD_LEFT = 21;
@@ -89,6 +95,7 @@ public final class AndroidTvRemote {
     private static final int KEYCODE_MEDIA_FAST_FORWARD = 90;
     static final int KEYCODE_SETTINGS = 176;
     public static final int KEYCODE_WAKEUP = 224;
+    private static final int KEYCODE_VOICE_ASSIST = 231;
     private static final int DIRECTION_START_LONG = 1;
     private static final int DIRECTION_END_LONG = 2;
     private static final int DIRECTION_SHORT = 3;
@@ -223,6 +230,156 @@ public final class AndroidTvRemote {
         return pairing;
     }
 
+    public interface BoxesCallback {
+        void onBoxes(java.util.List<DiscoveredBox> boxes);
+    }
+
+    public static final class DiscoveredBox {
+        public final String host;
+        public final String name;
+
+        public DiscoveredBox(String host, String name) {
+            this.host = host;
+            this.name = name;
+        }
+    }
+
+    public static void discoverAll(Context context, BoxesCallback callback) {
+        java.util.Map<String, String> foundHosts = new java.util.concurrent.ConcurrentHashMap<>();
+
+        Runnable notify = () -> {
+            java.util.List<DiscoveredBox> list = new java.util.ArrayList<>();
+            for (java.util.Map.Entry<String, String> entry : foundHosts.entrySet()) {
+                list.add(new DiscoveredBox(entry.getKey(), entry.getValue()));
+            }
+            MAIN.post(() -> {
+                if (callback != null) callback.onBoxes(list);
+            });
+        };
+
+        NsdManager nsd = (NsdManager) context.getSystemService(Context.NSD_SERVICE);
+        WifiManager wifi = (WifiManager) context.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        WifiManager.MulticastLock lock = null;
+        if (wifi != null) {
+            lock = wifi.createMulticastLock("lgremote-androidtv-all");
+            lock.setReferenceCounted(false);
+            lock.acquire();
+        }
+
+        WifiManager.MulticastLock held = lock;
+        NsdManager.DiscoveryListener[] discoveryRef = new NsdManager.DiscoveryListener[1];
+        Runnable cleanup = () -> {
+            release(held);
+            NsdManager.DiscoveryListener active = discoveryRef[0];
+            if (active != null && nsd != null) {
+                try {
+                    nsd.stopServiceDiscovery(active);
+                } catch (Exception ignored) {}
+            }
+        };
+
+        MAIN.postDelayed(cleanup, 4500);
+
+        if (nsd != null) {
+            java.util.Queue<NsdServiceInfo> resolveQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
+            java.util.concurrent.atomic.AtomicBoolean resolving = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+            Runnable processNext = new Runnable() {
+                @Override
+                public void run() {
+                    if (!resolving.compareAndSet(false, true)) {
+                        return;
+                    }
+                    NsdServiceInfo next = resolveQueue.poll();
+                    if (next == null) {
+                        resolving.set(false);
+                        return;
+                    }
+                    try {
+                        nsd.resolveService(next, new NsdManager.ResolveListener() {
+                            @Override
+                            public void onResolveFailed(NsdServiceInfo si, int errorCode) {
+                                Log.w(TAG, "NsdManager: resolve failed code=" + errorCode + " for " + si.getServiceName());
+                                resolving.set(false);
+                                run();
+                            }
+
+                            @Override
+                            public void onServiceResolved(NsdServiceInfo resolved) {
+                                InetAddress address = resolved.getHost();
+                                if (address != null) {
+                                    String host = address.getHostAddress();
+                                    String name = resolved.getServiceName();
+                                try {
+                                    java.util.Map<String, byte[]> attrs = resolved.getAttributes();
+                                    if (attrs != null) {
+                                        byte[] fn = attrs.get("fn");
+                                        if (fn != null && fn.length > 0) {
+                                            String f = new String(fn, java.nio.charset.StandardCharsets.UTF_8).trim();
+                                            if (!f.isEmpty()) name = f;
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
+                                    try {
+                                        java.util.Map<String, byte[]> attrs = resolved.getAttributes();
+                                        if (attrs != null) {
+                                            byte[] fn = attrs.get("fn");
+                                            if (fn != null && fn.length > 0) {
+                                                String f = new String(fn, java.nio.charset.StandardCharsets.UTF_8).trim();
+                                                if (!f.isEmpty()) name = f;
+                                            } else {
+                                                byte[] model = attrs.get("model");
+                                                if (model != null && model.length > 0) {
+                                                    String m = new String(model, java.nio.charset.StandardCharsets.UTF_8).trim();
+                                                    if (!m.isEmpty()) name = m;
+                                                }
+                                            }
+                                        }
+                                    } catch (Throwable ignored) {}
+                                    foundHosts.put(host, (name != null && !name.trim().isEmpty()) ? name.trim() : "Android TV");
+                                    notify.run();
+                                }
+                                resolving.set(false);
+                                run();
+                            }
+                        });
+                    } catch (Exception e) {
+                        Log.w(TAG, "NsdManager: resolve threw", e);
+                        resolving.set(false);
+                        run();
+                    }
+                }
+            };
+
+            NsdManager.DiscoveryListener discovery = new NsdManager.DiscoveryListener() {
+                @Override
+                public void onDiscoveryStarted(String serviceType) {}
+
+                @Override
+                public void onServiceFound(NsdServiceInfo serviceInfo) {
+                    resolveQueue.add(serviceInfo);
+                    processNext.run();
+                }
+
+                @Override
+                public void onServiceLost(NsdServiceInfo serviceInfo) {}
+
+                @Override
+                public void onDiscoveryStopped(String serviceType) {}
+
+                @Override
+                public void onStartDiscoveryFailed(String serviceType, int errorCode) {}
+
+                @Override
+                public void onStopDiscoveryFailed(String serviceType, int errorCode) {}
+            };
+            discoveryRef[0] = discovery;
+            try {
+                nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discovery);
+            } catch (Exception ignored) {}
+        }
+    }
+
     /** Finds the first Android TV remote service with mDNS. */
     public static void discover(Context context, HostCallback callback) {
         NsdManager nsd = (NsdManager) context.getSystemService(Context.NSD_SERVICE);
@@ -240,6 +397,7 @@ public final class AndroidTvRemote {
         }
 
         AtomicBoolean done = new AtomicBoolean();
+        AtomicBoolean resolving = new AtomicBoolean();
         WifiManager.MulticastLock held = lock;
         NsdManager.DiscoveryListener[] discoveryRef = new NsdManager.DiscoveryListener[1];
         Runnable[] timeoutRef = new Runnable[1];
@@ -257,42 +415,13 @@ public final class AndroidTvRemote {
             }
         };
         Runnable timeout = () -> {
+            cleanup.run();
             if (done.compareAndSet(false, true)) {
-                cleanup.run();
                 postHost(callback, null, "Could not find an Android TV box on this Wi-Fi.");
             }
         };
         timeoutRef[0] = timeout;
-        MAIN.postDelayed(timeout, 6500);
-
-        NsdManager.ResolveListener resolve = new NsdManager.ResolveListener() {
-            @Override
-            public void onResolveFailed(NsdServiceInfo serviceInfo, int errorCode) {
-                if (done.compareAndSet(false, true)) {
-                    cleanup.run();
-                    postHost(callback, null, "Found a box but could not resolve its address.");
-                }
-            }
-
-            @Override
-            public void onServiceResolved(NsdServiceInfo serviceInfo) {
-                if (!done.compareAndSet(false, true)) {
-                    return;
-                }
-                cleanup.run();
-                InetAddress address = serviceInfo.getHost();
-                if (address == null) {
-                    postHost(callback, null, "The Android TV box did not provide an address.");
-                    return;
-                }
-                String name = serviceInfo.getServiceName();
-                if (name != null && !name.trim().isEmpty()) {
-                    SecureStore.setBoxName(context, name.trim());
-                }
-                SecureStore.setBoxHost(context, address.getHostAddress());
-                postHost(callback, address.getHostAddress(), null);
-            }
-        };
+        MAIN.postDelayed(timeout, 3500);
 
         NsdManager.DiscoveryListener discovery = new NsdManager.DiscoveryListener() {
             @Override
@@ -301,12 +430,48 @@ public final class AndroidTvRemote {
 
             @Override
             public void onServiceFound(NsdServiceInfo serviceInfo) {
-                try {
-                    nsd.resolveService(serviceInfo, resolve);
-                } catch (Exception e) {
-                    if (done.compareAndSet(false, true)) {
-                        cleanup.run();
-                        postHost(callback, null, "Could not resolve the Android TV box.");
+                if (done.get()) return;
+                if (resolving.compareAndSet(false, true)) {
+                    try {
+                        nsd.resolveService(serviceInfo, new NsdManager.ResolveListener() {
+                            @Override
+                            public void onResolveFailed(NsdServiceInfo si, int errorCode) {
+                                Log.w(TAG, "NsdManager: resolve failed code=" + errorCode);
+                                resolving.set(false);
+                            }
+
+                            @Override
+                            public void onServiceResolved(NsdServiceInfo resolved) {
+                                if (!done.compareAndSet(false, true)) {
+                                    return;
+                                }
+                                cleanup.run();
+                                InetAddress address = resolved.getHost();
+                                if (address == null) {
+                                    postHost(callback, null, "Could not resolve the Android TV box address.");
+                                    return;
+                                }
+                                String name = resolved.getServiceName();
+                                try {
+                                    java.util.Map<String, byte[]> attrs = resolved.getAttributes();
+                                    if (attrs != null) {
+                                        byte[] fn = attrs.get("fn");
+                                        if (fn != null && fn.length > 0) {
+                                            String f = new String(fn, java.nio.charset.StandardCharsets.UTF_8).trim();
+                                            if (!f.isEmpty()) name = f;
+                                        }
+                                    }
+                                } catch (Throwable ignored) {}
+                                if (name != null && !name.trim().isEmpty()) {
+                                    SecureStore.setBoxName(context, name.trim());
+                                }
+                                SecureStore.setBoxHost(context, address.getHostAddress());
+                                postHost(callback, address.getHostAddress(), null);
+                            }
+                        });
+                    } catch (Exception e) {
+                        Log.w(TAG, "NsdManager: resolveService threw", e);
+                        resolving.set(false);
                     }
                 }
             }
@@ -323,7 +488,7 @@ public final class AndroidTvRemote {
             public void onStartDiscoveryFailed(String serviceType, int errorCode) {
                 if (done.compareAndSet(false, true)) {
                     cleanup.run();
-                    postHost(callback, null, "Local discovery failed on this phone.");
+                    postHost(callback, null, "Could not find an Android TV box on this Wi-Fi.");
                 }
             }
 
@@ -336,8 +501,10 @@ public final class AndroidTvRemote {
         try {
             nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discovery);
         } catch (Exception e) {
-            cleanup.run();
-            postHost(callback, null, "Local discovery is not available.");
+            if (done.compareAndSet(false, true)) {
+                cleanup.run();
+                postHost(callback, null, "Could not find an Android TV box on this Wi-Fi.");
+            }
         }
     }
 
@@ -396,11 +563,24 @@ public final class AndroidTvRemote {
             case "BACK":
                 return KEYCODE_BACK;
             case "PLAY":
+            case "PLAY_PAUSE":
+            case "PLAYPAUSE":
                 return KEYCODE_MEDIA_PLAY_PAUSE;
             case "REWIND":
                 return KEYCODE_MEDIA_REWIND;
             case "FASTFORWARD":
                 return KEYCODE_MEDIA_FAST_FORWARD;
+            case "SEARCH":
+            case "VOICE":
+                return KEYCODE_SEARCH;
+            case "VOLUMEUP":
+                return KEYCODE_VOLUME_UP;
+            case "VOLUMEDOWN":
+                return KEYCODE_VOLUME_DOWN;
+            case "MUTE":
+                return KEYCODE_VOLUME_MUTE;
+            case "POWER":
+                return KEYCODE_POWER;
             default:
                 return 0;
         }
@@ -421,7 +601,20 @@ public final class AndroidTvRemote {
                 return "OK";
             case "BACK":
                 return "Back";
+            case "SEARCH":
+            case "VOICE":
+                return "Voice";
+            case "VOLUMEUP":
+                return "Vol +";
+            case "VOLUMEDOWN":
+                return "Vol −";
+            case "MUTE":
+                return "Mute";
+            case "POWER":
+                return "Power";
             case "PLAY":
+            case "PLAY_PAUSE":
+            case "PLAYPAUSE":
                 return "Play/pause";
             case "REWIND":
                 return "Rewind";
@@ -525,6 +718,80 @@ public final class AndroidTvRemote {
         current.sendKey(KEYCODE_ENTER, "Enter", callback);
     }
 
+    public interface VoiceCallback {
+        void onVoiceReady(int sessionId);
+        void onVoiceEnded(int sessionId);
+        void onError(String error);
+    }
+
+    public interface VoiceSessionListener {
+        void onIncomingVoiceSession(int sessionId, String packageName);
+        void onVoiceSessionEnded(int sessionId);
+    }
+
+    private static volatile VoiceSessionListener voiceSessionListener;
+
+    private static volatile String lastBoxApp = "";
+
+    public static String getLastBoxApp() {
+        return lastBoxApp;
+    }
+
+    public static void setVoiceSessionListener(VoiceSessionListener listener) {
+        voiceSessionListener = listener;
+    }
+
+    public static boolean isVoiceSessionActive() {
+        TextMonitor current = textMonitor;
+        return current != null && current.voiceSessionId >= 0;
+    }
+
+    public static void startVoice(VoiceCallback callback) {
+        TextMonitor current = textMonitor;
+        if (current == null || !current.isReady()) {
+            if (callback != null) {
+                MAIN.post(() -> callback.onError("The Android TV box connection is not ready."));
+            }
+            return;
+        }
+        current.startVoice(callback);
+    }
+
+    public static void sendVoiceChunk(byte[] chunk) {
+        TextMonitor current = textMonitor;
+        if (current != null) {
+            current.sendVoiceChunk(chunk);
+        }
+    }
+
+    public static void sendVoiceChunk(int sessionId, byte[] chunk) {
+        TextMonitor current = textMonitor;
+        if (current != null) {
+            current.sendVoiceChunk(sessionId, chunk);
+        }
+    }
+
+    public static void endVoice() {
+        TextMonitor current = textMonitor;
+        if (current != null) {
+            current.endVoice();
+        }
+    }
+
+    public static void endVoice(int sessionId) {
+        TextMonitor current = textMonitor;
+        if (current != null) {
+            current.endVoice(sessionId);
+        }
+    }
+
+    public static void openApp(String appLink) {
+        TextMonitor current = textMonitor;
+        if (current != null) {
+            current.openApp(appLink);
+        }
+    }
+
     /** A key-inject message with a field status means a text field is focused, even when empty. */
     static boolean injectHasFocusedField(RemoteInfo info) {
         return info != null && info.imeInject && info.hasFieldStatus;
@@ -543,6 +810,8 @@ public final class AndroidTvRemote {
         private volatile boolean fieldFocused;
         private boolean lastFocused;
         private String lastLabel = "";
+        private volatile int voiceSessionId = -1;
+        private volatile VoiceCallback voiceCallback;
 
         TextMonitor(Context context, String host, TextFocusCallback callback) {
             this.context = context;
@@ -562,6 +831,8 @@ public final class AndroidTvRemote {
 
         void stop() {
             stopped = true;
+            voiceSessionId = -1;
+            voiceCallback = null;
             closeQuietly(socket);
         }
 
@@ -573,6 +844,102 @@ public final class AndroidTvRemote {
                 }
                 send(current, message);
             }
+        }
+
+        void startVoice(VoiceCallback callback) {
+            if (!started || socket == null) {
+                if (callback != null) {
+                    MAIN.post(() -> callback.onError("The Android TV box is still connecting."));
+                }
+                return;
+            }
+            if (voiceSessionId >= 0) {
+                int activeId = voiceSessionId;
+                Log.d(TAG, "Box Voice: already active session id=" + activeId + ", streaming to it");
+                if (callback != null) {
+                    MAIN.post(() -> callback.onVoiceReady(activeId));
+                }
+                return;
+            }
+            this.voiceCallback = callback;
+            IO.execute(() -> {
+                try {
+                    Log.d(TAG, "Box Voice: requesting voice session via KEYCODE_SEARCH");
+                    write(remoteKey(KEYCODE_SEARCH));
+                } catch (Exception e) {
+                    Log.w(TAG, "Box Voice: failed to send voice search key", e);
+                    if (callback != null) {
+                        MAIN.post(() -> callback.onError(friendly(e)));
+                    }
+                }
+            });
+        }
+
+        void sendVoiceChunk(byte[] chunk) {
+            sendVoiceChunk(voiceSessionId, chunk);
+        }
+
+        void sendVoiceChunk(int sessionId, byte[] chunk) {
+            if (sessionId < 0 || socket == null || chunk == null || chunk.length == 0) {
+                return;
+            }
+            int maxSize = 20 * 1024;
+            int minSize = 8 * 1024;
+            for (int i = 0; i < chunk.length; i += maxSize) {
+                int len = Math.min(chunk.length - i, maxSize);
+                byte[] part;
+                if (len < minSize) {
+                    part = new byte[minSize];
+                    System.arraycopy(chunk, i, part, 0, len);
+                } else if (i == 0 && len == chunk.length) {
+                    part = chunk;
+                } else {
+                    part = new byte[len];
+                    System.arraycopy(chunk, i, part, 0, len);
+                }
+                try {
+                    write(remoteVoicePayload(sessionId, part));
+                    Log.d(TAG, "Box Voice: sent chunk sid=" + sessionId + " len=" + part.length);
+                } catch (IOException e) {
+                    Log.w(TAG, "Box Voice: failed to send audio payload", e);
+                    break;
+                }
+            }
+        }
+
+        void endVoice() {
+            endVoice(voiceSessionId);
+        }
+
+        void endVoice(int sessionId) {
+            voiceCallback = null;
+            if (sessionId >= 0 && socket != null) {
+                if (voiceSessionId == sessionId) {
+                    voiceSessionId = -1;
+                }
+                IO.execute(() -> {
+                    try {
+                        Log.d(TAG, "Box Voice: ending voice session id=" + sessionId);
+                        write(remoteVoiceEnd(sessionId));
+                    } catch (Exception e) {
+                        Log.w(TAG, "Box Voice: failed to send voice end", e);
+                    }
+                });
+            }
+        }
+
+        void openApp(String appLink) {
+            if (socket == null || appLink == null || appLink.isEmpty()) {
+                return;
+            }
+            IO.execute(() -> {
+                try {
+                    Log.d(TAG, "Box App: launching " + appLink);
+                    write(remoteAppLink(appLink));
+                } catch (IOException e) {
+                    Log.w(TAG, "Box App: failed to launch app", e);
+                }
+            });
         }
 
         void sendText(String text, ResultCallback callback) {
@@ -761,6 +1128,9 @@ public final class AndroidTvRemote {
                         // The live counters live in the inject message. Echoing the ones from the
                         // echoed batch edit is what makes the box drop the text without a word.
                         state.onInject(info);
+                        if (info.imeApp != null && !info.imeApp.isEmpty()) {
+                            lastBoxApp = info.imeApp;
+                        }
                         Log.d(TAG, "Box IME: inject app=" + info.imeApp
                                 + " hasField=" + info.hasFieldStatus
                                 + " label=" + label
@@ -777,10 +1147,37 @@ public final class AndroidTvRemote {
                             report(true, label);
                         }
                     }
+                    if (info.voiceBegin) {
+                        voiceSessionId = info.voiceSessionId;
+                        Log.d(TAG, "Box Voice: session begin received id=" + voiceSessionId + " pkg=" + info.voicePackage);
+                        write(remoteVoiceBegin(voiceSessionId));
+                        VoiceCallback cb = voiceCallback;
+                        if (cb != null) {
+                            MAIN.post(() -> cb.onVoiceReady(voiceSessionId));
+                        }
+                        VoiceSessionListener sl = voiceSessionListener;
+                        if (sl != null) {
+                            MAIN.post(() -> sl.onIncomingVoiceSession(voiceSessionId, info.voicePackage));
+                        }
+                    }
+                    if (info.voiceEnd) {
+                        Log.d(TAG, "Box Voice: session end received id=" + info.voiceSessionId);
+                        VoiceCallback cb = voiceCallback;
+                        if (cb != null) {
+                            MAIN.post(() -> cb.onVoiceEnded(info.voiceSessionId));
+                        }
+                        VoiceSessionListener sl = voiceSessionListener;
+                        if (sl != null) {
+                            MAIN.post(() -> sl.onVoiceSessionEnded(info.voiceSessionId));
+                        }
+                        voiceSessionId = -1;
+                    }
                 }
             } finally {
                 started = false;
                 fieldFocused = false;
+                voiceSessionId = -1;
+                voiceCallback = null;
                 report(false, "");
                 if (socket == current) {
                     socket = null;
@@ -1223,6 +1620,63 @@ public final class AndroidTvRemote {
         return message.bytes();
     }
 
+    static byte[] remoteVoiceBegin(int sessionId) {
+        Writer voice = new Writer();
+        voice.varint(1, sessionId);
+        Writer message = new Writer();
+        message.bytes(30, voice.bytes());
+        return message.bytes();
+    }
+
+    static byte[] remoteVoicePayload(int sessionId, byte[] samples) {
+        Writer payload = new Writer();
+        payload.varint(1, sessionId);
+        payload.bytes(2, samples);
+        Writer message = new Writer();
+        message.bytes(31, payload.bytes());
+        return message.bytes();
+    }
+
+    static byte[] remoteVoiceEnd(int sessionId) {
+        Writer voice = new Writer();
+        voice.varint(1, sessionId);
+        Writer message = new Writer();
+        message.bytes(32, voice.bytes());
+        return message.bytes();
+    }
+
+    static String prettyAppName(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return "";
+        if (pkg.contains("tvhome")) return "TV Home Launcher";
+        if (pkg.contains("smarttube") || pkg.contains("videomanager")) return "SmartTube";
+        if (pkg.contains("nuvio")) return "Nuvio";
+        if (pkg.contains("youtube")) return "YouTube";
+        if (pkg.contains("netflix")) return "Netflix";
+        if (pkg.contains("amazonvideo") || pkg.contains("primevideo")) return "Prime Video";
+        if (pkg.contains("disneyplus")) return "Disney+";
+        if (pkg.contains("tubi")) return "Tubi";
+        if (pkg.contains("paramountplus") || pkg.contains("cbs.ott")) return "Paramount+";
+        if (pkg.contains("settings")) return "Android TV Settings";
+        if (pkg.contains("vending")) return "Google Play Store";
+        if (pkg.contains("plex")) return "Plex";
+        if (pkg.contains("kodi")) return "Kodi";
+        if (pkg.contains("vlc")) return "VLC";
+        int lastDot = pkg.lastIndexOf('.');
+        if (lastDot >= 0 && lastDot < pkg.length() - 1) {
+            String last = pkg.substring(lastDot + 1);
+            return Character.toUpperCase(last.charAt(0)) + last.substring(1);
+        }
+        return pkg;
+    }
+
+    static byte[] remoteAppLink(String appLink) {
+        Writer link = new Writer();
+        link.string(1, appLink);
+        Writer message = new Writer();
+        message.bytes(90, link.bytes());
+        return message.bytes();
+    }
+
     /** Turns a caret offset in code points into an index in the Java string. */
     static int codePointOffsetToIndex(String text, int codePointOffset) {
         if (text == null || codePointOffset <= 0) {
@@ -1462,6 +1916,10 @@ public final class AndroidTvRemote {
         boolean imeBatchEdit;
         boolean imeShow;
         boolean hasFieldStatus;
+        boolean voiceBegin;
+        boolean voiceEnd;
+        int voiceSessionId = -1;
+        String voicePackage = "";
         int features;
         int pingValue;
         int imeCounter;
@@ -1552,6 +2010,30 @@ public final class AndroidTvRemote {
                         parseTextFieldStatus(new Reader(show.bytes()), info);
                     } else {
                         show.skip();
+                    }
+                }
+            } else if (field == 30) {
+                info.voiceBegin = true;
+                Reader voice = new Reader(reader.bytes());
+                while (voice.next()) {
+                    int sub = voice.field();
+                    if (sub == 1) {
+                        info.voiceSessionId = (int) voice.varint();
+                    } else if (sub == 2) {
+                        info.voicePackage = voice.string();
+                    } else {
+                        voice.skip();
+                    }
+                }
+            } else if (field == 32) {
+                info.voiceEnd = true;
+                Reader voice = new Reader(reader.bytes());
+                while (voice.next()) {
+                    int sub = voice.field();
+                    if (sub == 1) {
+                        info.voiceSessionId = (int) voice.varint();
+                    } else {
+                        voice.skip();
                     }
                 }
             } else if (field == 40) {

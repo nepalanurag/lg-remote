@@ -5,6 +5,7 @@ import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
+import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.AttributeSet;
@@ -28,11 +29,14 @@ public final class DpadView extends View {
     private static final int OK = 5;
 
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint fillCenter = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint accent = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint accentSoft = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ink = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint chevronPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint dividerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path arrow = new Path();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final RectF arcRect = new RectF();
@@ -73,18 +77,27 @@ public final class DpadView extends View {
         setFocusable(true);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
         setContentDescription("Direction pad");
-        fill.setColor(getContext().getColor(R.color.surface));
+        fill.setColor(getContext().getColor(R.color.surface_2));
+        fillCenter.setColor(getContext().getColor(R.color.surface_container));
         stroke.setStyle(Paint.Style.STROKE);
         stroke.setStrokeWidth(Ui.dp(getContext(), 1));
         stroke.setColor(getContext().getColor(R.color.stroke));
         accent.setColor(getContext().getColor(R.color.accent));
-        accentSoft.setColor(getContext().getColor(R.color.accent_dim));
+        accentSoft.setColor(0x28FFFFFF);
         ink.setColor(getContext().getColor(R.color.muted));
-        ink.setStyle(Paint.Style.FILL);
-        text.setColor(getContext().getColor(R.color.on_accent));
-        text.setTextAlign(Paint.Align.CENTER);
-        text.setTypeface(android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.BOLD));
-        text.setTextSize(Ui.dp(getContext(), 15));
+        chevronPaint.setStyle(Paint.Style.STROKE);
+        chevronPaint.setStrokeWidth(Ui.dp(getContext(), 2.8f));
+        chevronPaint.setStrokeCap(Paint.Cap.ROUND);
+        chevronPaint.setStrokeJoin(Paint.Join.ROUND);
+
+        textPaint.setColor(getContext().getColor(R.color.text));
+        textPaint.setTextSize(Ui.dp(getContext(), 15));
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextAlign(Paint.Align.CENTER);
+
+        dividerPaint.setColor(getContext().getColor(R.color.stroke));
+        dividerPaint.setStrokeWidth(Ui.dp(getContext(), 1f));
+        dividerPaint.setStyle(Paint.Style.STROKE);
     }
 
     public void setListener(Listener listener) {
@@ -123,7 +136,7 @@ public final class DpadView extends View {
         cx = w / 2f;
         cy = h / 2f;
         radius = Math.min(w, h) / 2f - Ui.dp(getContext(), 2);
-        inner = radius * 0.37f;
+        inner = radius * 0.36f;
         arcRect.set(cx - radius, cy - radius, cx + radius, cy + radius);
     }
 
@@ -150,44 +163,46 @@ public final class DpadView extends View {
             canvas.drawArc(arcRect, start, 90, true, accentSoft);
         }
 
+        // Sector hairline dividers (crosslines at 45 degree angles)
+        float cos45 = 0.7071f;
+        canvas.drawLine(cx + inner * cos45, cy + inner * cos45, cx + radius * cos45, cy + radius * cos45, dividerPaint);
+        canvas.drawLine(cx - inner * cos45, cy + inner * cos45, cx - radius * cos45, cy + radius * cos45, dividerPaint);
+        canvas.drawLine(cx - inner * cos45, cy - inner * cos45, cx - radius * cos45, cy - radius * cos45, dividerPaint);
+        canvas.drawLine(cx + inner * cos45, cy - inner * cos45, cx + radius * cos45, cy - radius * cos45, dividerPaint);
+
         canvas.drawCircle(cx, cy, radius, stroke);
 
+        // Center button: sleek matte circular button with subtle border
         boolean active = pressed == OK;
-        accent.setAlpha(isEnabled() ? 255 : 90);
-        ink.setAlpha(isEnabled() ? 255 : 90);
-        canvas.drawCircle(cx, cy, inner, accent);
-        if (active) {
-            Paint highlight = new Paint(Paint.ANTI_ALIAS_FLAG);
-            highlight.setColor(0x44FFFFFF);
-            canvas.drawCircle(cx, cy, inner, highlight);
-        }
+        canvas.drawCircle(cx, cy, inner, active ? accentSoft : fillCenter);
+        canvas.drawCircle(cx, cy, inner, stroke);
 
-        // Arrows
+        // "OK" label in center disc
+        textPaint.setColor(active ? getContext().getColor(R.color.accent) : getContext().getColor(R.color.text));
+        Paint.FontMetrics fm = textPaint.getFontMetrics();
+        float textY = cy - (fm.ascent + fm.descent) / 2f;
+        canvas.drawText("OK", cx, textY, textPaint);
+
+        // Chevrons
         int arrowColor = pressed != NONE && pressed != OK
                 ? getContext().getColor(R.color.accent) : ink.getColor();
-        Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        arrowPaint.setColor(arrowColor);
-        arrowPaint.setStyle(Paint.Style.FILL);
-        float distance = radius * 0.66f;
-        float size = Math.max(Ui.dp(getContext(), 6), radius * 0.09f);
-        drawArrow(canvas, arrowPaint, cx, cy - distance, 0, size);
-        drawArrow(canvas, arrowPaint, cx + distance, cy, 90, size);
-        drawArrow(canvas, arrowPaint, cx, cy + distance, 180, size);
-        drawArrow(canvas, arrowPaint, cx - distance, cy, 270, size);
-
-        text.setColor(getContext().getColor(R.color.on_accent));
-        text.setAlpha(isEnabled() ? 255 : 90);
-        canvas.drawText("OK", cx, cy - (text.ascent() + text.descent()) / 2f, text);
+        chevronPaint.setColor(arrowColor);
+        chevronPaint.setAlpha(isEnabled() ? 255 : 90);
+        float distance = (radius + inner) / 2f;
+        float size = Math.max(Ui.dp(getContext(), 8.5f), radius * 0.08f);
+        drawChevron(canvas, chevronPaint, cx, cy - distance, 0, size);
+        drawChevron(canvas, chevronPaint, cx + distance, cy, 90, size);
+        drawChevron(canvas, chevronPaint, cx, cy + distance, 180, size);
+        drawChevron(canvas, chevronPaint, cx - distance, cy, 270, size);
     }
 
-    private void drawArrow(Canvas canvas, Paint paint, float x, float y, float rotation, float size) {
+    private void drawChevron(Canvas canvas, Paint paint, float x, float y, float rotation, float size) {
         canvas.save();
         canvas.rotate(rotation, x, y);
         arrow.reset();
-        arrow.moveTo(x, y - size);
-        arrow.lineTo(x + size * 0.9f, y + size * 0.7f);
-        arrow.lineTo(x - size * 0.9f, y + size * 0.7f);
-        arrow.close();
+        arrow.moveTo(x - size, y + size * 0.40f);
+        arrow.lineTo(x, y - size * 0.40f);
+        arrow.lineTo(x + size, y + size * 0.40f);
         canvas.drawPath(arrow, paint);
         canvas.restore();
     }

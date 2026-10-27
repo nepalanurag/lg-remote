@@ -29,4 +29,18 @@ public final class Routing {
         }
         return configuredInputId.equals(activeInputId) || configuredInputId.equals(activeAppId);
     }
+
+    /**
+     * Determines whether the Android TV box is active given the device mode and active HDMI input.
+     */
+    public static boolean isBoxActive(int deviceMode, String configuredInputId, String activeInputId,
+                                      String activeAppId) {
+        if (deviceMode == SecureStore.MODE_ANDROID_TV) {
+            return true;
+        }
+        if (deviceMode == SecureStore.MODE_LG_TV) {
+            return false;
+        }
+        return isBoxInput(configuredInputId, activeInputId, activeAppId);
+    }
 }

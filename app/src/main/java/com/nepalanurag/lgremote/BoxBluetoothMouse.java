@@ -17,6 +17,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 
+import java.util.Locale;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -32,37 +33,10 @@ import java.util.concurrent.TimeUnit;
  */
 public final class BoxBluetoothMouse {
     private static final String TAG = "LgRemote";
-    public static final byte REPORT_ID_KEYBOARD = 1;
     public static final byte REPORT_ID_MOUSE = 2;
     public static final byte REPORT_ID_BATTERY = 32;
 
-    private static final byte[] COMBO_REPORT_DESCRIPTOR = {
-            // Keyboard
-            (byte) 0x05, (byte) 0x01, // Usage page (Generic Desktop)
-            (byte) 0x09, (byte) 0x06, // Usage (Keyboard)
-            (byte) 0xA1, (byte) 0x01, // Collection (Application)
-            (byte) 0x85, REPORT_ID_KEYBOARD, // Report ID (1)
-            (byte) 0x05, (byte) 0x07, // Usage page (Key Codes)
-            (byte) 0x19, (byte) 0xE0, // Usage minimum (224)
-            (byte) 0x29, (byte) 0xE7, // Usage maximum (231)
-            (byte) 0x15, (byte) 0x00, // Logical minimum (0)
-            (byte) 0x25, (byte) 0x01, // Logical maximum (1)
-            (byte) 0x75, (byte) 0x01, // Report size (1)
-            (byte) 0x95, (byte) 0x08, // Report count (8)
-            (byte) 0x81, (byte) 0x02, // Input (Data, Variable, Absolute)
-            (byte) 0x75, (byte) 0x08, // Report size (8)
-            (byte) 0x95, (byte) 0x01, // Report count (1)
-            (byte) 0x81, (byte) 0x01, // Input (Constant)
-            (byte) 0x75, (byte) 0x08, // Report size (8)
-            (byte) 0x95, (byte) 0x06, // Report count (6)
-            (byte) 0x15, (byte) 0x00, // Logical Minimum (0)
-            (byte) 0x25, (byte) 0x65, // Logical Maximum (101)
-            (byte) 0x05, (byte) 0x07, // Usage page (Key Codes)
-            (byte) 0x19, (byte) 0x00, // Usage Minimum (0)
-            (byte) 0x29, (byte) 0x65, // Usage Maximum (101)
-            (byte) 0x81, (byte) 0x00, // Input (Data, Array)
-            (byte) 0xC0,              // End Collection
-
+    private static final byte[] MOUSE_REPORT_DESCRIPTOR = {
             // Mouse
             (byte) 0x05, (byte) 0x01, // Usage Page (Generic Desktop)
             (byte) 0x09, (byte) 0x02, // Usage (Mouse)
@@ -157,11 +131,9 @@ public final class BoxBluetoothMouse {
             BoxBluetoothMouse.this.registered = registered;
             if (registered) {
                 if (pluggedDevice != null) {
-                    connectedDevice = pluggedDevice;
                     SecureStore.setBoxBtMac(context, pluggedDevice.getAddress());
-                } else {
-                    autoConnect();
                 }
+                autoConnect();
             }
             notifyListener();
         }
@@ -178,6 +150,7 @@ public final class BoxBluetoothMouse {
             Log.d(TAG, "Bluetooth HID connection state: device=" + deviceName + " state=" + state);
             if (state == BluetoothProfile.STATE_CONNECTED) {
                 connectedDevice = device;
+                mainHandler.removeCallbacks(retryConnectRunnable);
                 if (device != null) {
                     SecureStore.setBoxBtMac(context, device.getAddress());
                 }
@@ -197,10 +170,8 @@ public final class BoxBluetoothMouse {
                         hidDevice.reportError(device, BluetoothHidDevice.ERROR_RSP_UNSUPPORTED_REQ);
                         return;
                     }
-                    if (id == REPORT_ID_MOUSE) {
-                        hidDevice.replyReport(device, type, id, lastMouseReport);
-                    } else if (id == REPORT_ID_KEYBOARD) {
-                        hidDevice.replyReport(device, type, id, new byte[8]);
+                    if (id == REPORT_ID_MOUSE || id == 0) {
+                        hidDevice.replyReport(device, type, REPORT_ID_MOUSE, lastMouseReport);
                     } else {
                         hidDevice.reportError(device, BluetoothHidDevice.ERROR_RSP_INVALID_RPT_ID);
                     }
@@ -286,16 +257,48 @@ public final class BoxBluetoothMouse {
         }
     }
 
+    private final Runnable retryConnectRunnable = this::doConnectAttempt;
+    private BluetoothDevice targetDevice;
+    private int retryCount = 0;
+    private static final int MAX_RETRIES = 7;
+
+    public void connectWithRetry(BluetoothDevice device) {
+        if (device == null) return;
+        targetDevice = device;
+        SecureStore.setBoxBtMac(context, device.getAddress());
+        retryCount = 0;
+        mainHandler.removeCallbacks(retryConnectRunnable);
+        doConnectAttempt();
+    }
+
+    private void doConnectAttempt() {
+        if (isConnected() || targetDevice == null || !hasPermission()) {
+            return;
+        }
+        if (!registered) {
+            mainHandler.postDelayed(retryConnectRunnable, 400);
+            return;
+        }
+        boolean initiated = connect(targetDevice);
+        Log.d(TAG, "Bluetooth HID connectWithRetry (#" + retryCount + ") to " + targetDevice.getAddress() + " initiated=" + initiated);
+        retryCount++;
+        if (!isConnected() && retryCount < MAX_RETRIES) {
+            long delay = Math.min(1000L * retryCount, 3000L);
+            mainHandler.postDelayed(retryConnectRunnable, delay);
+        }
+    }
+
     public boolean connect(BluetoothDevice device) {
         if (device == null || hidDevice == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.P || !hasPermission()) {
             return false;
         }
+        if (isConnected() && device.equals(connectedDevice)) {
+            return true;
+        }
         try {
             boolean initiated = hidDevice.connect(device);
             Log.d(TAG, "Bluetooth HID connect to " + device.getAddress() + " initiated: " + initiated);
-            if (initiated) {
-                SecureStore.setBoxBtMac(context, device.getAddress());
-            }
+            SecureStore.setBoxBtMac(context, device.getAddress());
             return initiated;
         } catch (SecurityException e) {
             Log.w(TAG, "Cannot initiate Bluetooth HID connect: " + e.getMessage());
@@ -328,15 +331,38 @@ public final class BoxBluetoothMouse {
             try {
                 BluetoothDevice dev = adapter.getRemoteDevice(savedMac);
                 if (dev != null) {
-                    connect(dev);
+                    connectWithRetry(dev);
+                    return;
                 }
             } catch (Exception e) {
                 Log.w(TAG, "Bluetooth HID autoConnect error: " + e.getMessage());
             }
         }
+        // Fallback: If no saved MAC, check bonded devices for an Android TV box candidate
+        try {
+            String savedLabel = SecureStore.getBoxInputLabel(context);
+            String targetLabel = (savedLabel != null && !savedLabel.isEmpty()) ? savedLabel.toLowerCase(Locale.ROOT) : null;
+            for (BluetoothDevice dev : adapter.getBondedDevices()) {
+                if (dev == null) continue;
+                String name = dev.getName();
+                if (name != null) {
+                    String lower = name.toLowerCase(Locale.ROOT);
+                    if ((targetLabel != null && (lower.contains(targetLabel) || targetLabel.contains(lower)))
+                            || lower.contains("onn") || lower.contains("tv") || lower.contains("den")
+                            || lower.contains("shield") || lower.contains("chromecast")
+                            || lower.contains("box") || lower.contains("google")) {
+                        Log.d(TAG, "Bluetooth HID autoConnect bonded candidate: " + name + " (" + dev.getAddress() + ")");
+                        connectWithRetry(dev);
+                        break;
+                    }
+                }
+            }
+        } catch (SecurityException ignored) {
+        }
     }
 
     public void disconnect() {
+        mainHandler.removeCallbacks(retryConnectRunnable);
         if (connectedDevice != null && hidDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && hasPermission()) {
             try {
                 hidDevice.disconnect(connectedDevice);
@@ -359,6 +385,7 @@ public final class BoxBluetoothMouse {
     }
 
     public void stop() {
+        mainHandler.removeCallbacks(retryConnectRunnable);
         if (hidDevice != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             if (registered && hasPermission()) {
                 try {
@@ -381,14 +408,14 @@ public final class BoxBluetoothMouse {
             return;
         }
         BluetoothHidDeviceAppSdpSettings sdp = new BluetoothHidDeviceAppSdpSettings(
+                "LG Remote Mouse",
+                "Bluetooth Mouse",
                 "LG Remote",
-                "Android TV Input",
-                "LG Remote",
-                BluetoothHidDevice.SUBCLASS1_COMBO,
-                COMBO_REPORT_DESCRIPTOR
+                BluetoothHidDevice.SUBCLASS1_MOUSE,
+                MOUSE_REPORT_DESCRIPTOR
         );
         try {
-            hidDevice.registerApp(sdp, null, QOS_OUT, executor, hidCallback);
+            hidDevice.registerApp(sdp, null, null, executor, hidCallback);
         } catch (SecurityException e) {
             Log.w(TAG, "Cannot register Bluetooth HID app: " + e.getMessage());
         }

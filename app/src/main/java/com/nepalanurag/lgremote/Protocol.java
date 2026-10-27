@@ -19,7 +19,7 @@ public final class Protocol {
             "LEFT", "RIGHT", "UP", "DOWN", "ENTER", "BACK", "EXIT", "HOME", "MENU", "INFO",
             "DASH", "ASTERISK", "CC", "PLAY", "PAUSE", "STOP", "REWIND", "FASTFORWARD",
             "RED", "GREEN", "YELLOW", "BLUE", "VOLUMEUP", "VOLUMEDOWN", "MUTE",
-            "CHANNELUP", "CHANNELDOWN",
+            "CHANNELUP", "CHANNELDOWN", "GUIDE",
             "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"));
 
     private Protocol() {

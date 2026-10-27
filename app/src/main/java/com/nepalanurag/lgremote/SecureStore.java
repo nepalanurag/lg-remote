@@ -9,6 +9,10 @@ import android.util.Base64;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.List;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -37,6 +41,22 @@ public final class SecureStore {
     private static final String PREF_BOX_INPUT_LABEL = "box_input_label";
     private static final String PREF_BOX_MAC = "box_mac";
     private static final String PREF_BOX_BT_MAC = "box_bt_mac";
+    private static final String PREF_DEVICE_MODE = "device_mode";
+    private static final String PREF_BOX_APPS = "box_apps_json";
+
+    public static final class SavedApp {
+        public final String name;
+        public final String pkg;
+
+        public SavedApp(String name, String pkg) {
+            this.name = name;
+            this.pkg = pkg;
+        }
+    }
+
+    public static final int MODE_AUTO = 0;
+    public static final int MODE_ANDROID_TV = 1;
+    public static final int MODE_LG_TV = 2;
 
     // Older builds stored the same Android TV pairing under "den" keys. Read them once so an
     // existing pairing keeps working after the app became device-name agnostic.
@@ -281,6 +301,14 @@ public final class SecureStore {
         return generator.generateKey();
     }
 
+    public static int getDeviceMode(Context context) {
+        return prefs(context).getInt(PREF_DEVICE_MODE, MODE_AUTO);
+    }
+
+    public static void setDeviceMode(Context context, int mode) {
+        prefs(context).edit().putInt(PREF_DEVICE_MODE, mode).apply();
+    }
+
     public static String getSavedIp(Context context) {
         return prefs(context).getString(PREF_TV_IP, null);
     }
@@ -356,6 +384,85 @@ public final class SecureStore {
 
     public static void setAutoConnect(Context context, boolean enabled) {
         prefs(context).edit().putBoolean(PREF_AUTO_CONNECT, enabled).apply();
+    }
+
+    public static List<SavedApp> getBoxApps(Context context) {
+        String json = prefs(context).getString(PREF_BOX_APPS, null);
+        List<SavedApp> list = new ArrayList<>();
+        if (json != null && !json.isEmpty()) {
+            try {
+                JSONArray arr = new JSONArray(json);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject obj = arr.getJSONObject(i);
+                    String name = obj.optString("name", "");
+                    String pkg = obj.optString("pkg", "");
+                    if (!pkg.isEmpty()
+                            && !pkg.equals("com.crunchyroll.crunchyroid")
+                            && !pkg.equals("com.surfshark.vpnclient.android")
+                            && !pkg.equals("com.internet.tvbrowser")
+                            && !pkg.equals("com.teamsmart.videomanager.tv")
+                            && !pkg.equals("com.android.vending")) {
+                        list.add(new SavedApp(name.isEmpty() ? pkg : name, pkg));
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (list.isEmpty()) {
+            list.add(new SavedApp("TV Home Launcher", "com.nepalanurag.tvhome"));
+            list.add(new SavedApp("Nuvio", "com.nuvio.tv"));
+            list.add(new SavedApp("YouTube", "com.google.android.youtube.tv"));
+            list.add(new SavedApp("Netflix", "com.netflix.ninja"));
+            list.add(new SavedApp("Prime Video", "com.amazon.amazonvideo.livingroom"));
+            list.add(new SavedApp("Disney+", "com.disney.disneyplus"));
+            list.add(new SavedApp("Tubi", "com.tubitv"));
+            list.add(new SavedApp("Android TV Settings", "com.android.tv.settings"));
+        }
+        saveBoxApps(context, list);
+        return list;
+    }
+
+    public static void saveBoxApps(Context context, List<SavedApp> apps) {
+        JSONArray arr = new JSONArray();
+        for (SavedApp app : apps) {
+            try {
+                JSONObject obj = new JSONObject();
+                obj.put("name", app.name);
+                obj.put("pkg", app.pkg);
+                arr.put(obj);
+            } catch (Exception ignored) {
+            }
+        }
+        prefs(context).edit().putString(PREF_BOX_APPS, arr.toString()).apply();
+    }
+
+    public static void removeBoxApp(Context context, String pkg) {
+        List<SavedApp> current = getBoxApps(context);
+        List<SavedApp> updated = new ArrayList<>();
+        for (SavedApp app : current) {
+            if (!app.pkg.equalsIgnoreCase(pkg)) {
+                updated.add(app);
+            }
+        }
+        saveBoxApps(context, updated);
+    }
+
+    public static void addBoxApp(Context context, String name, String pkg) {
+        if (pkg == null || pkg.trim().isEmpty()) {
+            return;
+        }
+        List<SavedApp> current = getBoxApps(context);
+        String cleanPkg = pkg.trim();
+        String cleanName = name == null || name.trim().isEmpty() ? cleanPkg : name.trim();
+        for (int i = 0; i < current.size(); i++) {
+            if (current.get(i).pkg.equalsIgnoreCase(cleanPkg)) {
+                current.set(i, new SavedApp(cleanName, cleanPkg));
+                saveBoxApps(context, current);
+                return;
+            }
+        }
+        current.add(new SavedApp(cleanName, cleanPkg));
+        saveBoxApps(context, current);
     }
 
     /** Fresh random key material for tests of the wire format (never stored). */

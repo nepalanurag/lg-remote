@@ -213,6 +213,66 @@ public final class LgTvClient {
         return stateDetail;
     }
 
+    public void playMedia(RemoteController.Callback callback) {
+        sendButton("PLAY");
+        request("ssap://media.controls/play", new JsonObject(), new Callback() {
+            @Override
+            public void onSuccess(JsonObject response) {
+                if (callback != null) callback.onResult(true, null);
+            }
+
+            @Override
+            public void onError(String message) {
+                if (callback != null) callback.onResult(true, null);
+            }
+        }, false);
+    }
+
+    public void pauseMedia(RemoteController.Callback callback) {
+        sendButton("PAUSE");
+        request("ssap://media.controls/pause", new JsonObject(), new Callback() {
+            @Override
+            public void onSuccess(JsonObject response) {
+                if (callback != null) callback.onResult(true, null);
+            }
+
+            @Override
+            public void onError(String message) {
+                if (callback != null) callback.onResult(true, null);
+            }
+        }, false);
+    }
+
+    public void rewindMedia(RemoteController.Callback callback) {
+        request("ssap://media.controls/rewind", new JsonObject(), new Callback() {
+            @Override
+            public void onSuccess(JsonObject response) {
+                if (callback != null) callback.onResult(true, null);
+            }
+
+            @Override
+            public void onError(String message) {
+                boolean sent = sendButton("REWIND");
+                if (callback != null) callback.onResult(sent, sent ? null : message);
+            }
+        }, false);
+    }
+
+    public void fastForwardMedia(RemoteController.Callback callback) {
+        request("ssap://media.controls/fastForward", new JsonObject(), new Callback() {
+            @Override
+            public void onSuccess(JsonObject response) {
+                if (callback != null) callback.onResult(true, null);
+            }
+
+            @Override
+            public void onError(String message) {
+                boolean sent = sendButton("FASTFORWARD");
+                if (callback != null) callback.onResult(sent, sent ? null : message);
+            }
+        }, false);
+    }
+
     public boolean isConnected() {
         return registered;
     }
@@ -1218,11 +1278,18 @@ public final class LgTvClient {
     }
 
     public void launchApp(String appId) {
+        launchApp(appId, null);
+    }
+
+    public void launchApp(String appId, String contentId) {
         if (appId == null) {
             return;
         }
         JsonObject payload = new JsonObject();
         payload.addProperty("id", appId);
+        if (contentId != null && !contentId.isEmpty()) {
+            payload.addProperty("contentId", contentId);
+        }
         request("ssap://com.webos.applicationManager/launch", payload, noop(), false);
     }
 

@@ -40,4 +40,21 @@ public class RoutingTest {
         // No input on screen means a webOS app is in front, so the TV stays in charge.
         assertFalse(Routing.isBoxInput("HDMI_3", null, null));
     }
+
+    @Test
+    public void androidTvOnlyModeAlwaysRoutesToTheBox() {
+        assertTrue(Routing.isBoxActive(SecureStore.MODE_ANDROID_TV, null, null, null));
+        assertTrue(Routing.isBoxActive(SecureStore.MODE_ANDROID_TV, "HDMI_1", "HDMI_2", null));
+    }
+
+    @Test
+    public void lgTvOnlyModeAlwaysRoutesToTheTv() {
+        assertFalse(Routing.isBoxActive(SecureStore.MODE_LG_TV, "HDMI_1", "HDMI_1", null));
+    }
+
+    @Test
+    public void autoModeDelegatesToActiveInput() {
+        assertTrue(Routing.isBoxActive(SecureStore.MODE_AUTO, "HDMI_3", "HDMI_3", null));
+        assertFalse(Routing.isBoxActive(SecureStore.MODE_AUTO, "HDMI_3", "HDMI_1", null));
+    }
 }
